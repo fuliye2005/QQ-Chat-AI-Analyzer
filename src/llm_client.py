@@ -8,7 +8,8 @@ LLM Client Module (Phase 2)
 """
 
 import os
-from typing import Dict, Any, List, Optional
+import time
+from typing import Callable, Dict, Any, List, Optional
 try:
     from openai import OpenAI
 except ImportError:
@@ -21,7 +22,17 @@ class LLMClient:
     LLM 客户端，支持默认配置与自定义配置双模式。
     """
 
-    def __init__(self, mode: str = LLM_MODE_DEFAULT, api_key: str = None, base_url: str = DEFAULT_API_BASE, model: str = DEFAULT_MODEL):
+    def __init__(
+        self,
+        mode: str = LLM_MODE_DEFAULT,
+        api_key: str = None,
+        base_url: str = DEFAULT_API_BASE,
+        model: str = DEFAULT_MODEL,
+        timeout: int = DEFAULT_LLM_TIMEOUT_SECONDS,
+        max_output_tokens: Optional[int] = DEFAULT_LLM_MAX_OUTPUT_TOKENS,
+        max_retries: int = DEFAULT_LLM_MAX_RETRIES,
+        logger: Optional[Callable[[str], None]] = None,
+    ):
         # 意义: 初始化客户端
         # 作用: 加载 API Key 和 Base URL
         # 关联: 被主程序调用
@@ -31,6 +42,10 @@ class LLMClient:
         self.base_url = base_url
         self.model = model
         self.client = None
+        self.timeout = max(1, int(timeout))
+        self.max_output_tokens = int(max_output_tokens) if max_output_tokens else None
+        self.max_retries = max(1, int(max_retries))
+        self.logger = logger
         
         if mode == LLM_MODE_DEFAULT and not self.api_key:
             # 默认模式：尝试从环境变量读取
@@ -41,7 +56,19 @@ class LLMClient:
             try:
                 self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
             except Exception as e:
-                print(f"[Warning] Failed to init OpenAI client: {e}")
+                self._log(f"LLM 客户端初始化失败: {type(e).__name__}: {e}")
+
+    def _log(self, message: str):
+        """Send diagnostics to both the console and the task logger when available."""
+        print(f"[LLM] {message}")
+        if self.logger:
+            self.logger(message)
+
+    @staticmethod
+    def _estimate_input_tokens(system_prompt: str, user_prompt: str) -> int:
+        # This is a conservative display estimate, not a provider tokenizer result.
+        chars = len(system_prompt or "") + len(user_prompt or "")
+        return max(1, int(chars / 1.5))
 
     def generate_summary(self, text_content: str) -> str:
         """生成总结报告"""
@@ -53,7 +80,13 @@ class LLMClient:
         system_prompt = "你是一个情感分析师。请分析以下对话的情感基调，并给出积极/消极/中性评价，以及关键的情绪触发点。请直接返回 HTML 片段。"
         return self.chat_completion(system_prompt, f"以下是部分聊天记录采样：\n{text_content}")
 
-    def chat_completion(self, system_prompt: str, user_prompt: str, model: Optional[str] = None) -> str:
+    def chat_completion(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        model: Optional[str] = None,
+        request_name: str = "LLM",
+    ) -> str:
         """
         调用 LLM Chat Completion API。
         """
@@ -62,64 +95,68 @@ class LLMClient:
         # 关联: 核心 AI 功能入口
         
         target_model = model if model else self.model
-        
+        input_chars = len(system_prompt or "") + len(user_prompt or "")
+        estimated_input_tokens = self._estimate_input_tokens(system_prompt, user_prompt)
+
         # 1. 尝试真实调用
         if self.client:
-            # 简单重试机制 (Max 2 times)
-            max_retries = 2
-            for attempt in range(max_retries):
+            self._log(
+                f"{request_name} 请求开始 | model={target_model} | "
+                f"input_chars={input_chars} | approx_input_tokens={estimated_input_tokens} | "
+                f"output_limit={self.max_output_tokens or 'provider_default'} | "
+                f"timeout={self.timeout}s | attempts={self.max_retries}"
+            )
+            last_error = None
+            for attempt in range(self.max_retries):
+                started_at = time.monotonic()
                 try:
-                    print(f"[Info] Sending request to {target_model} (Attempt {attempt+1}/{max_retries})...")
-                    response = self.client.chat.completions.create(
-                        model=target_model,
-                        messages=[
+                    self._log(f"{request_name} 第 {attempt + 1}/{self.max_retries} 次请求")
+                    request_kwargs = {
+                        "model": target_model,
+                        "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt}
                         ],
-                        timeout=60  # 设置 60s 超时
-                    )
+                        "timeout": self.timeout,
+                    }
+                    if self.max_output_tokens:
+                        request_kwargs["max_completion_tokens"] = self.max_output_tokens
+                    response = self.client.chat.completions.create(**request_kwargs)
                     content = response.choices[0].message.content
                     if not content:
                         raise ValueError("Empty response from LLM")
+                    elapsed = time.monotonic() - started_at
+                    self._log(
+                        f"{request_name} 请求成功 | elapsed={elapsed:.1f}s | "
+                        f"output_chars={len(content)}"
+                    )
                     return content
                     
                 except Exception as e:
-                    error_msg = str(e)
-                    print(f"[Error] API Call Failed (Attempt {attempt+1}): {error_msg}")
-                    
-                    # 如果是最后一次尝试，且是自定义模式，则返回错误 UI
-                    if attempt == max_retries - 1:
-                        if self.mode != LLM_MODE_DEFAULT:
-                            print(f"[Error] All retries failed. Returning error message to UI.")
-                            return f"""
-                            <div style="border: 2px solid #ff4444; padding: 15px; background: #fff0f0; color: #cc0000; border-radius: 8px; margin: 20px 0; font-family: sans-serif;">
-                                <h3 style="margin-top:0; color: #cc0000;">⚠️ AI 生成失败 (API Error)</h3>
-                                <div style="margin-bottom: 10px;">
-                                    <strong>错误信息:</strong> <code style="background: #eee; padding: 2px 5px; border-radius: 4px;">{error_msg}</code>
-                                </div>
-                                <ul style="padding-left: 20px; color: #666;">
-                                    <li><strong>模型:</strong> {target_model}</li>
-                                    <li><strong>地址:</strong> {str(self.client.base_url)}</li>
-                                    <li><strong>建议:</strong> 请检查 API Key 余额、网络连通性或模型名称是否正确。</li>
-                                </ul>
-                            </div>
-                            """
-                    # 否则继续下一次重试
-                    import time
-                    time.sleep(1) # Backoff
-        
-        # 2. Mock 回退 (仅在默认模式或无 Client 时触发)
+                    last_error = e
+                    elapsed = time.monotonic() - started_at
+                    self._log(
+                        f"{request_name} 请求失败 | attempt={attempt + 1}/{self.max_retries} | "
+                        f"elapsed={elapsed:.1f}s | error_type={type(e).__name__} | error={e}"
+                    )
+                    if attempt < self.max_retries - 1:
+                        self._log(f"{request_name} 将在 1 秒后重试")
+                        time.sleep(1)
+
+            self._log(
+                f"{request_name} 最终失败 | model={target_model} | "
+                f"attempts={self.max_retries} | error_type={type(last_error).__name__} | error={last_error}"
+            )
+            # A real request must never silently turn into a fake successful result.
+            raise RuntimeError(f"{request_name} API 请求失败: {last_error}") from last_error
+
+        # 2. Mock is only used when the application explicitly has no real client.
         if self.mode == LLM_MODE_DEFAULT:
-             print("[Info] Using Mock response (Default Mode).")
+             self._log(f"{request_name} 使用内置 Mock | 未初始化真实 API 客户端")
              return self._mock_response(user_prompt)
         else:
-             # Custom 模式下如果没有 Client 初始化成功 (比如一开始 Key 就空的)，也返回错误
-             return f"""
-             <div style="border: 2px solid #ff9800; padding: 15px; background: #fff8e1; color: #e65100; border-radius: 8px;">
-                <h3>⚠️ 客户端未初始化</h3>
-                <p>请先在左侧配置并保存有效的 API Key。</p>
-             </div>
-             """
+             self._log(f"{request_name} 无法发送 | custom 模式但真实 API 客户端未初始化")
+             raise RuntimeError("Custom 模式下 LLM 客户端未初始化")
 
     def test_connection(self) -> dict:
         """

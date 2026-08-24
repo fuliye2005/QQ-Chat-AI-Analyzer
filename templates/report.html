@@ -12,7 +12,7 @@
             --text-color: {{ summary.style_config.text_color if summary.style_config else '#333333' }};
             --card-bg: {{ summary.style_config.card_bg if summary.style_config else '#FFFFFF' }};
             --font-stack: {{ summary.style_config.font_family if summary.style_config else "'PingFang SC', 'Microsoft YaHei', sans-serif" }};
-            --glass-bg: rgba(255, 255, 255, 0.9);
+            --glass-bg: var(--card-bg);
             --shadow-sm: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
             --shadow-md: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
             --shadow-lg: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
@@ -26,7 +26,7 @@
         body {
             font-family: var(--font-stack);
             background-color: var(--bg-color);
-            background-image: linear-gradient(135deg, var(--bg-color) 0%, rgba(255,255,255,0.5) 100%);
+            background-image: linear-gradient(135deg, var(--bg-color) 0%, rgba(255,255,255,0.06) 100%);
             color: var(--text-color);
             margin: 0;
             padding: 40px 20px;
@@ -44,7 +44,7 @@
             text-align: center;
             padding: 80px 40px;
             margin-bottom: 60px;
-            background: var(--glass-bg);
+            background: var(--card-bg);
             border-radius: 24px;
             box-shadow: var(--shadow-lg);
             backdrop-filter: blur(10px);
@@ -136,7 +136,7 @@
 
         .stat-item {
             text-align: center;
-            background: #fff;
+            background: var(--card-bg);
             padding: 30px 20px;
             border-radius: 20px;
             box-shadow: var(--shadow-sm);
@@ -174,7 +174,7 @@
         }
         
         .keyword-tag {
-            background: #fff;
+            background: var(--card-bg);
             color: var(--text-color);
             padding: 10px 25px;
             border-radius: 50px;
@@ -209,7 +209,7 @@
             bottom: 0;
             left: 24px;
             width: 4px;
-            background: rgba(0,0,0,0.05);
+            background: rgba(127,127,127,0.25);
             border-radius: 2px;
         }
         
@@ -233,7 +233,7 @@
             background: var(--bg-color);
             border-radius: 50%;
             border: 5px solid var(--primary-color);
-            box-shadow: 0 0 0 5px rgba(255,255,255,0.5);
+            box-shadow: 0 0 0 5px rgba(127,127,127,0.14);
             z-index: 1;
             transition: all 0.3s;
         }
@@ -255,7 +255,7 @@
             width: 100%;
             border-collapse: separate;
             border-spacing: 0;
-            background: #fff;
+            background: var(--card-bg);
             border-radius: 16px;
             overflow: hidden;
             box-shadow: var(--shadow-sm);
@@ -273,7 +273,7 @@
         
         .ranking-table td {
             padding: 16px 20px;
-            border-bottom: 1px solid #f0f0f0;
+            border-bottom: 1px solid rgba(127,127,127,0.2);
             color: var(--text-color);
         }
         
@@ -282,7 +282,7 @@
         }
         
         .ranking-table tr:hover td {
-            background-color: #fafafa;
+            background-color: rgba(127,127,127,0.08);
         }
         
         .ranking-table tr td:first-child {
@@ -302,7 +302,7 @@
             border-left: 4px solid var(--secondary-color);
             margin: 20px 0;
             padding: 15px 25px;
-            background: rgba(0,0,0,0.02);
+            background: rgba(127,127,127,0.08);
             border-radius: 0 12px 12px 0;
             font-style: italic;
         }
@@ -314,63 +314,18 @@
             header { padding: 40px 20px; }
             .stats-grid { grid-template-columns: 1fr 1fr; }
         }
-    </style>
-
-        .stat-label {
-            font-size: 0.9em;
-            color: #666;
-            margin-top: 5px;
-        }
-
-        /* Ranking Tables */
-        .ranking-table {
-            width: 100%;
-            border-collapse: collapse;
-            background: white;
-            border-radius: 8px;
-            overflow: hidden;
-            margin-bottom: 20px;
-        }
-        
-        .ranking-table th, .ranking-table td {
-            padding: 12px 15px;
-            text-align: left;
-            border-bottom: 1px solid #eee;
-        }
-        
-        .ranking-table th {
-            background-color: var(--primary-color);
-            color: white;
-            font-weight: normal;
-        }
-        
-        .ranking-table tr:last-child td {
-            border-bottom: none;
-        }
-        
-        .ranking-table tr:hover {
-            background-color: #fff5f5;
-        }
-
-        /* AI Content Styles */
-        .ai-content p {
-            margin-bottom: 15px;
-            text-align: justify;
-        }
-        
         .ai-content ul {
             padding-left: 20px;
         }
-        
+
         .ai-content li {
             margin-bottom: 8px;
         }
-        
-        /* Specific Styles for Sections */
+
         .portrait-tag {
             display: inline-block;
             background: var(--primary-color);
-            color: white;
+            color: #fff;
             padding: 5px 15px;
             border-radius: 20px;
             font-size: 1.2em;
@@ -380,7 +335,8 @@
         footer {
             text-align: center;
             margin-top: 60px;
-            color: #999;
+            color: var(--text-color);
+            opacity: 0.7;
             font-size: 0.8em;
             padding-bottom: 40px;
         }

@@ -7,6 +7,9 @@
   "model_reduce": "",
   "model_refine": "",
   "max_tokens": 128000,
+  "request_timeout_seconds": 180,
+  "request_max_output_tokens": 8000,
+  "request_max_retries": 2,
   "anime_theme": "default",
   "custom_theme_prompt": "",
   "enhance_mode": false

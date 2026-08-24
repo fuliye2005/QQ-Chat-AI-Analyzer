@@ -14,6 +14,7 @@ Registry Module
 # --- JSON 字段映射 (Field Mapping) ---
 JSON_FIELD_MESSAGES = "messages"
 JSON_FIELD_TIMESTAMP = "timestamp"
+JSON_FIELD_TIME = "time"
 JSON_FIELD_SENDER = "sender"
 JSON_FIELD_SENDER_UIN = "uin"
 JSON_FIELD_SENDER_UID = "uid"
@@ -23,6 +24,7 @@ JSON_FIELD_CONTENT = "content"
 JSON_FIELD_TEXT = "text"
 JSON_FIELD_RESOURCES = "resources"
 JSON_FIELD_IS_RECALLED = "isRecalled"
+JSON_FIELD_RECALLED = "recalled"
 JSON_FIELD_MENTIONS = "mentions"
 JSON_FIELD_CHAT_INFO = "chatInfo"
 JSON_FIELD_CHAT_NAME = "name"
@@ -236,6 +238,12 @@ LLM_MODE_CUSTOM = "custom"
 DEFAULT_API_BASE = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o"
 DEFAULT_TEMPERATURE = 0.7
+
+# --- Runtime request controls ---
+# Long-context analysis can legitimately take longer than the original 60s limit.
+DEFAULT_LLM_TIMEOUT_SECONDS = 180
+DEFAULT_LLM_MAX_OUTPUT_TOKENS = 8000
+DEFAULT_LLM_MAX_RETRIES = 2
 
 # --- Sampling Levels (Phase 2) ---
 LEVEL_1_LOSSLESS = "lossless"

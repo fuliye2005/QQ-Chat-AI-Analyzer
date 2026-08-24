@@ -1,0 +1,7 @@
+config.local.json
+history.local.json
+output/
+uploads/
+__pycache__/
+**/__pycache__/
+*.py[cod]

@@ -12,12 +12,21 @@ from src.renderer import HTMLRenderer as ReportRenderer
 from src.llm_client import LLMClient
 from src.generator import ReportGenerator
 from src.history import HistoryManager
+from src.registry import (
+    DEFAULT_LLM_MAX_OUTPUT_TOKENS,
+    DEFAULT_LLM_MAX_RETRIES,
+    DEFAULT_LLM_TIMEOUT_SECONDS,
+    LLM_MODE_DEFAULT,
+    LLM_MODE_CUSTOM,
+)
 
 # --- Config ---
 UPLOAD_FOLDER = 'uploads'
 OUTPUT_FOLDER = 'output'
 HISTORY_FILE = 'history.json'
 CONFIG_FILE = 'config.json'
+LOCAL_HISTORY_FILE = 'history.local.json'
+LOCAL_CONFIG_FILE = 'config.local.json'
 ALLOWED_EXTENSIONS = {'json'}
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -32,7 +41,12 @@ app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB limit
 # In a production app, use Redis/Celery. Here we use a simple dict for local usage.
 tasks = {}
 
-history_manager = HistoryManager(HISTORY_FILE)
+history_manager = HistoryManager(LOCAL_HISTORY_FILE)
+
+
+def get_active_config_file():
+    """Use local settings when present, while keeping the tracked template public-safe."""
+    return LOCAL_CONFIG_FILE if os.path.exists(LOCAL_CONFIG_FILE) else CONFIG_FILE
 
 # --- Helpers ---
 def allowed_file(filename):
@@ -126,16 +140,31 @@ def run_analysis_task(task_id, file_path, config):
         # 3. AI Analysis (Map-Reduce)
         logger.progress(45, "正在初始化 AI 分析组件...")
         
-        llm_config = {}
-        # Base config for LLMClient (acts as default)
-        if config.get('mode') == 'custom':
-            llm_config = {
+        request_timeout = int(config.get('request_timeout_seconds', DEFAULT_LLM_TIMEOUT_SECONDS))
+        request_output_tokens = int(config.get('request_max_output_tokens', DEFAULT_LLM_MAX_OUTPUT_TOKENS))
+        request_retries = int(config.get('request_max_retries', DEFAULT_LLM_MAX_RETRIES))
+        llm_mode = config.get('mode', LLM_MODE_DEFAULT)
+
+        llm_config = {
+            'mode': llm_mode,
+            'timeout': request_timeout,
+            'max_output_tokens': request_output_tokens,
+            'max_retries': request_retries,
+            'logger': logger.info,
+        }
+        if llm_mode == LLM_MODE_CUSTOM:
+            llm_config.update({
                 'api_key': config.get('api_key'),
                 'base_url': config.get('base_url'),
-                'model': config.get('model') # Default model
-            }
+                'model': config.get('model'),
+            })
         else:
             logger.info("使用内置演示模式 (Mock)")
+
+        logger.info(
+            f"LLM请求配置: mode={llm_mode}, timeout={request_timeout}s, "
+            f"output_limit={request_output_tokens} tokens, retries={request_retries}"
+        )
             
         # Get specific models for each phase
         model_map = config.get('model_map') or llm_config.get('model')
@@ -143,8 +172,9 @@ def run_analysis_task(task_id, file_path, config):
         model_refine = config.get('model_refine') or llm_config.get('model')
 
         client = LLMClient(**llm_config)
-        generator = ReportGenerator(client)
+        generator = ReportGenerator(client, logger=logger.info)
         max_tokens = int(config.get('max_tokens', 128000))
+        logger.info(f"本地输入采样预算: {max_tokens} tokens（不等于 API 输出上限）")
 
         # Step 1: Map (Quarterly/Periodic Analysis)
         logger.info("正在进行切分...")
@@ -360,15 +390,16 @@ def handle_config():
     if request.method == 'POST':
         try:
             config_data = request.json
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            with open(LOCAL_CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(config_data, f, indent=2)
             return jsonify({'status': 'success', 'message': 'Config saved'})
         except Exception as e:
             return jsonify({'status': 'error', 'message': str(e)})
     else:
         try:
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            config_path = get_active_config_file()
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
                     return jsonify(json.load(f))
             return jsonify({})
         except Exception as e:

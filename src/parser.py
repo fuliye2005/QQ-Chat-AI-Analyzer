@@ -9,7 +9,6 @@ QQ Chat Parser Module
 
 import json
 import pandas as pd
-from datetime import datetime
 from typing import Dict, Any, Tuple, List, Optional
 from src.registry import *
 
@@ -72,14 +71,11 @@ class QQChatParser:
         # 关联: 被 parse_json 循环调用
         
         # 1. 时间处理
-        timestamp = msg.get(JSON_FIELD_TIMESTAMP)
-        try:
-            if timestamp:
-                dt = pd.to_datetime(timestamp)
-            else:
-                dt = datetime.now()
-        except:
-            dt = datetime.now()
+        # 新版导出同时提供 ISO 时间字符串和毫秒时间戳，优先使用带时区的 time。
+        dt = self._parse_message_time(msg)
+        if dt is None:
+            # 无法确定时间的消息不能伪造为“当前时间”，否则会污染日期、季度和作息统计。
+            return None
 
         # 2. 发送者识别 (Phase 1 核心: User Identification)
         sender = msg.get(JSON_FIELD_SENDER, {})
@@ -110,7 +106,12 @@ class QQChatParser:
             if text_content and resources:
                 msg_type = MSG_TYPE_MIXED
 
-        if msg.get(JSON_FIELD_IS_RECALLED):
+        is_recalled = msg.get(
+            JSON_FIELD_IS_RECALLED,
+            msg.get(JSON_FIELD_RECALLED, False)
+        )
+
+        if is_recalled:
             msg_type = MSG_TYPE_RECALLED
 
         # 4. 提及处理
@@ -125,7 +126,50 @@ class QQChatParser:
             COL_USER_NAME: user_name,
             COL_CONTENT: text_content,
             COL_TYPE: msg_type,
-            COL_IS_RECALLED: msg.get(JSON_FIELD_IS_RECALLED, False),
+            COL_IS_RECALLED: bool(is_recalled),
             COL_MENTIONS: mentions,
             COL_IMAGE_COUNT: image_count
         }
+
+    def _parse_message_time(self, msg: Dict[str, Any]) -> Optional[pd.Timestamp]:
+        """解析消息时间，兼容 ISO 字符串以及秒/毫秒/微秒/纳秒时间戳。"""
+        raw_time = msg.get(JSON_FIELD_TIME)
+        if raw_time not in (None, ""):
+            try:
+                parsed = pd.to_datetime(raw_time, utc=True)
+                if not pd.isna(parsed):
+                    return parsed
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+        raw_timestamp = msg.get(JSON_FIELD_TIMESTAMP)
+        if raw_timestamp in (None, "") or isinstance(raw_timestamp, bool):
+            return None
+
+        try:
+            if isinstance(raw_timestamp, (int, float)):
+                numeric_timestamp = raw_timestamp
+            elif isinstance(raw_timestamp, str):
+                timestamp_text = raw_timestamp.strip()
+                try:
+                    numeric_timestamp = float(timestamp_text)
+                except ValueError:
+                    parsed = pd.to_datetime(timestamp_text, utc=True)
+                    return None if pd.isna(parsed) else parsed
+            else:
+                return pd.to_datetime(raw_timestamp, utc=True)
+
+            magnitude = abs(float(numeric_timestamp))
+            if magnitude >= 1e17:
+                unit = "ns"
+            elif magnitude >= 1e14:
+                unit = "us"
+            elif magnitude >= 1e11:
+                unit = "ms"
+            else:
+                unit = "s"
+
+            parsed = pd.to_datetime(numeric_timestamp, unit=unit, utc=True)
+            return None if pd.isna(parsed) else parsed
+        except (TypeError, ValueError, OverflowError):
+            return None

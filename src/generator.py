@@ -7,7 +7,7 @@ Report Generator Module (Phase 3)
 遵循 Phase 5 编程规范。
 """
 
-from typing import Dict, List, Any
+from typing import Callable, Dict, List, Any, Optional
 import json
 import time
 from src.registry import *
@@ -19,12 +19,18 @@ class ReportGenerator:
     报告生成器核心类，协调 LLM Client 和 Prompt Manager。
     """
 
-    def __init__(self, llm_client: LLMClient):
+    def __init__(self, llm_client: LLMClient, logger: Optional[Callable[[str], None]] = None):
         # 意义: 初始化生成器
         # 作用: 注入 LLM 客户端依赖
         # 关联: 依赖 src.llm_client
         self.llm = llm_client
         self.prompts = PromptManager()
+        self.logger = logger
+
+    def _log(self, message: str):
+        print(f"[Generator] {message}")
+        if self.logger:
+            self.logger(message)
 
     def generate_quarterly_analysis(self, quarter: str, content: str, model: str = None, is_periodic: bool = False) -> Dict[str, Any]:
         """
@@ -38,7 +44,12 @@ class ReportGenerator:
         system_prompt = "你是一个 JSON 生成器。请仅返回合法的 JSON 数据，不要包含 markdown 代码块标记。"
         
         try:
-            response = self.llm.chat_completion(system_prompt, prompt, model=model)
+            response = self.llm.chat_completion(
+                system_prompt,
+                prompt,
+                model=model,
+                request_name=f"Map:{quarter}",
+            )
             
             # 清理 Markdown 标记
             clean_response = response.strip()
@@ -49,16 +60,13 @@ class ReportGenerator:
             if clean_response.endswith("```"):
                 clean_response = clean_response[:-3]
                 
-            return json.loads(clean_response)
+            result = json.loads(clean_response)
+            self._log(f"Map:{quarter} JSON 解析成功 | keys={len(result) if isinstance(result, dict) else 'non-object'}")
+            return result
             
         except Exception as e:
-            print(f"Error in generating quarterly analysis for {quarter}: {e}")
-            return {
-                "summary": f"{quarter} 分析失败",
-                "characters": {},
-                "relations": [],
-                "vibe": "未知"
-            }
+            self._log(f"Map:{quarter} 失败 | error_type={type(e).__name__} | error={e}")
+            raise RuntimeError(f"Map 阶段 {quarter} 失败: {e}") from e
 
     def generate_annual_report(self, quarterly_results: List[Dict], global_stats: Dict, anime_theme: str = "default", custom_theme_prompt: str = "", model: str = None, is_periodic: bool = False) -> Dict[str, Any]:
         """
@@ -72,7 +80,12 @@ class ReportGenerator:
         system_prompt = "你是一个 JSON 生成器。请仅返回合法的 JSON 数据，不要包含 markdown 代码块标记。"
         
         try:
-            response = self.llm.chat_completion(system_prompt, prompt, model=model)
+            response = self.llm.chat_completion(
+                system_prompt,
+                prompt,
+                model=model,
+                request_name="Reduce:汇总报告",
+            )
             
             # 清理 Markdown 标记
             clean_response = response.strip()
@@ -84,6 +97,10 @@ class ReportGenerator:
                 clean_response = clean_response[:-3]
                 
             result = json.loads(clean_response)
+            self._log(
+                f"Reduce:汇总报告 JSON 解析成功 | "
+                f"keys={len(result) if isinstance(result, dict) else 'non-object'}"
+            )
             
             # Ensure anime_theater exists (fallback for missing key)
             if "anime_theater" not in result or not result["anime_theater"]:
@@ -91,16 +108,8 @@ class ReportGenerator:
                 
             return result
         except Exception as e:
-             print(f"Error in generating annual report: {e}")
-             return {
-                 "portrait": "<h3>群画像</h3><p>生成失败</p>",
-                 "quarterly_review": "<h3>深度复盘</h3><p>生成失败</p>",
-                 "roasts": "<h3>群成员锐评</h3><p>生成失败</p>",
-                 "awards": "<h3>颁奖典礼</h3><p>生成失败</p>",
-                 "anime_theater": "<h3>动漫IP小剧场</h3><p>生成失败</p>",
-                 "moments": "<h3>社死/搞笑时刻回顾</h3><p>生成失败</p>",
-                 "essay": "<h3>总结小作文</h3><p>生成失败</p>"
-             }
+             self._log(f"Reduce:汇总报告 失败 | error_type={type(e).__name__} | error={e}")
+             raise RuntimeError(f"汇总阶段失败: {e}") from e
 
     def refine_report_html(self, html_content: str, model: str = None) -> str:
         """
@@ -111,7 +120,12 @@ class ReportGenerator:
         
         try:
             # 注意：这里可能会消耗较多 Token，取决于 HTML 大小
-            response = self.llm.chat_completion(system_prompt, prompt, model=model)
+            response = self.llm.chat_completion(
+                system_prompt,
+                prompt,
+                model=model,
+                request_name="Refine:HTML增强",
+            )
             
             # 清理 Markdown 标记
             clean_response = response.strip()
