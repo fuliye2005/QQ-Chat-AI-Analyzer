@@ -4,6 +4,7 @@ import time
 import threading
 import uuid
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 from src.parser import QQChatParser
@@ -18,6 +19,7 @@ from src.registry import (
     DEFAULT_LLM_TIMEOUT_SECONDS,
     LLM_MODE_DEFAULT,
     LLM_MODE_CUSTOM,
+    COL_DATETIME,
 )
 
 # --- Config ---
@@ -28,6 +30,12 @@ CONFIG_FILE = 'config.json'
 LOCAL_HISTORY_FILE = 'history.local.json'
 LOCAL_CONFIG_FILE = 'config.local.json'
 ALLOWED_EXTENSIONS = {'json'}
+TOKEN_TO_CHAR_RATIO = 1.5
+MAX_INPUT_TOKEN_BUDGET = 1_200_000
+SAFE_API_SEGMENT_TOKEN_BUDGET = 900_000
+DEFAULT_MAP_CONCURRENCY = 2
+MAX_MAP_CONCURRENCY = 16
+PENDING_UPLOAD_TTL_SECONDS = 3600
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -40,6 +48,8 @@ app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB limit
 # --- Global State for Tasks ---
 # In a production app, use Redis/Celery. Here we use a simple dict for local usage.
 tasks = {}
+pending_uploads = {}
+pending_uploads_lock = threading.Lock()
 
 history_manager = HistoryManager(LOCAL_HISTORY_FILE)
 
@@ -52,26 +62,96 @@ def get_active_config_file():
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+
+def normalize_years(values):
+    """Normalize user-selected years into sorted unique integers."""
+    if values is None:
+        return []
+    if not isinstance(values, (list, tuple, set)):
+        values = [values]
+
+    years = []
+    for value in values:
+        if isinstance(value, bool):
+            continue
+        try:
+            year = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= year <= 9999:
+            years.append(year)
+    return sorted(set(years))
+
+
+def get_year_summary(df):
+    """Return JSON-serializable year ranges and message counts."""
+    if df.empty:
+        return []
+
+    year_series = df[COL_DATETIME].dt.year
+    years = sorted({int(year) for year in year_series.dropna().unique()}, reverse=True)
+    summary = []
+    for year in years:
+        year_df = df[year_series == year]
+        summary.append({
+            'year': year,
+            'message_count': int(len(year_df)),
+            'start_time': year_df[COL_DATETIME].min().isoformat(),
+            'end_time': year_df[COL_DATETIME].max().isoformat(),
+        })
+    return summary
+
+
+def cleanup_pending_uploads():
+    """Remove inspection files that were uploaded but never started."""
+    cutoff = time.time() - PENDING_UPLOAD_TTL_SECONDS
+    expired_paths = []
+    with pending_uploads_lock:
+        for inspection_id, pending in list(pending_uploads.items()):
+            if pending['created_at'] < cutoff:
+                expired_paths.append(pending['file_path'])
+                del pending_uploads[inspection_id]
+
+    for file_path in expired_paths:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
 class TaskLogger:
     def __init__(self, task_id):
         self.task_id = task_id
+        self._lock = threading.Lock()
     
     def info(self, msg):
-        if self.task_id in tasks:
-            tasks[self.task_id]['logs'].append(msg)
-            print(f"[Task {self.task_id}] {msg}")
+        with self._lock:
+            if self.task_id in tasks:
+                tasks[self.task_id]['logs'].append(msg)
+                print(f"[Task {self.task_id}] {msg}")
 
     def progress(self, percent, status_text):
-        if self.task_id in tasks:
-            tasks[self.task_id]['progress'] = percent
-            tasks[self.task_id]['status_text'] = status_text
+        with self._lock:
+            if self.task_id in tasks:
+                tasks[self.task_id]['progress'] = percent
+                tasks[self.task_id]['status_text'] = status_text
 
 def smart_sample(df, max_tokens, logger=None):
     """
     智能采样函数，确保不超过 Token 预算。
     """
     # 估算字符限制 (1 Token ≈ 1.5 Chars)
-    target_chars = int(max_tokens * 1.5)
+    target_chars = max(1, int(max_tokens * TOKEN_TO_CHAR_RATIO))
+
+    def select_evenly(items, count):
+        """Select a chronological spread while keeping the first and last messages."""
+        if count >= len(items):
+            return items
+        if count <= 1:
+            return [items[0]]
+
+        last_index = len(items) - 1
+        return [items[(index * last_index) // (count - 1)] for index in range(count)]
+
+    def join_messages(items):
+        return "\n".join(items)
     
     # 预处理消息格式
     if 'formatted_msg' not in df.columns:
@@ -86,21 +166,82 @@ def smart_sample(df, max_tokens, logger=None):
     if total_msgs == 0:
         return ""
 
-    avg_len = sum(len(m) for m in full_text_list[:100]) / min(total_msgs, 100)
-    if avg_len == 0: avg_len = 50
-    
-    estimated_total_chars = total_msgs * avg_len
-    
+    estimated_total_chars = sum(len(m) for m in full_text_list) + max(0, total_msgs - 1)
+
     if estimated_total_chars <= target_chars:
         sampled_msgs = full_text_list
-        if logger: logger.info(f"数据量较小 ({estimated_total_chars} chars)，全量发送")
+        sample_text = join_messages(sampled_msgs)
+        if logger: logger.info(f"数据量较小 ({len(sample_text)} chars)，全量发送")
     else:
-        target_msg_count = int(target_chars / avg_len)
-        step = max(1, total_msgs // target_msg_count)
-        sampled_msgs = full_text_list[::step]
-        if logger: logger.info(f"数据量过大，执行均匀采样 (Step={step})。从 {total_msgs} 条中抽取 {len(sampled_msgs)} 条。")
-        
-    return "\n".join(sampled_msgs)
+        # Estimate a message count from the actual formatted text, then adjust
+        # until the joined result really fits the budget. The old floor-based
+        # stride could become 1 and accidentally send the complete oversized set.
+        target_msg_count = max(1, min(
+            total_msgs,
+            int(total_msgs * target_chars / estimated_total_chars),
+        ))
+        sampled_msgs = select_evenly(full_text_list, target_msg_count)
+        sample_text = join_messages(sampled_msgs)
+
+        while len(sample_text) > target_chars and target_msg_count > 1:
+            next_count = max(1, int(target_msg_count * target_chars / len(sample_text)))
+            if next_count >= target_msg_count:
+                next_count = target_msg_count - 1
+            target_msg_count = next_count
+            sampled_msgs = select_evenly(full_text_list, target_msg_count)
+            sample_text = join_messages(sampled_msgs)
+
+        # A single unusually long message is still bounded by the budget.
+        if len(sample_text) > target_chars:
+            sample_text = sample_text[:target_chars]
+
+        if logger:
+            logger.info(
+                f"数据量过大，执行均匀采样。从 {total_msgs} 条中抽取 {len(sampled_msgs)} 条，"
+                f"实际 {len(sample_text)} chars（目标不超过 {target_chars} chars）。"
+            )
+
+    return sample_text
+
+
+def split_text_by_token_budget(text, max_tokens):
+    """Split formatted chat text at message boundaries for one API request."""
+    if not text:
+        return [""]
+
+    max_chars = max(1, int(max_tokens * TOKEN_TO_CHAR_RATIO))
+    if len(text) <= max_chars:
+        return [text]
+
+    segments = []
+    current_lines = []
+    current_chars = 0
+
+    def flush_current():
+        if current_lines:
+            segments.append("\n".join(current_lines))
+
+    for line in text.splitlines():
+        # Formatted messages are short, but keep a hard fallback for unusual input.
+        if len(line) > max_chars:
+            flush_current()
+            current_lines.clear()
+            current_chars = 0
+            for start in range(0, len(line), max_chars):
+                segments.append(line[start:start + max_chars])
+            continue
+
+        added_chars = len(line) + (1 if current_lines else 0)
+        if current_lines and current_chars + added_chars > max_chars:
+            flush_current()
+            current_lines.clear()
+            current_chars = 0
+
+        current_lines.append(line)
+        current_chars += len(line) + (1 if len(current_lines) > 1 else 0)
+
+    flush_current()
+    return segments or [text[:max_chars]]
 
 # --- Analysis Worker ---
 def run_analysis_task(task_id, file_path, config):
@@ -124,6 +265,27 @@ def run_analysis_task(task_id, file_path, config):
         logger.progress(20, f"解析完成，共加载 {len(df)} 条消息")
         logger.info(f"解析成功: {len(df)} messages")
 
+        selected_years = normalize_years(config.get('selected_years'))
+        if selected_years:
+            available_years = {
+                int(year) for year in df[COL_DATETIME].dt.year.dropna().unique()
+            }
+            missing_years = [year for year in selected_years if year not in available_years]
+            if missing_years:
+                raise ValueError(
+                    f"所选年份不存在于文件中: {', '.join(map(str, missing_years))}"
+                )
+
+            df = df[df[COL_DATETIME].dt.year.isin(selected_years)].copy()
+            if df.empty:
+                raise ValueError("所选年份没有可分析的有效消息")
+
+            logger.progress(25, f"已选择 {len(selected_years)} 个年份，共 {len(df)} 条消息")
+            logger.info(
+                f"AI分析年份: {', '.join(map(str, selected_years))}；"
+                f"筛选后 {len(df)} messages"
+            )
+
         # 2. Analyze (Stats)
         logger.progress(30, "正在进行统计分析...")
         analyzer = ChatAnalyzer(df)
@@ -132,6 +294,12 @@ def run_analysis_task(task_id, file_path, config):
         # analyzer.get_basic_stats() returns dict. 
         # meta contains chat_name.
         stats.update(meta)
+        # The report should describe the selected subset, not the full source file.
+        stats['total_messages'] = len(df)
+        if selected_years:
+            stats['selected_years'] = selected_years
+            stats['start_time'] = df[COL_DATETIME].min().isoformat()
+            stats['end_time'] = df[COL_DATETIME].max().isoformat()
         
         daily_activity = analyzer.get_daily_activity()
         logger.progress(40, "统计分析完成")
@@ -173,20 +341,34 @@ def run_analysis_task(task_id, file_path, config):
 
         client = LLMClient(**llm_config)
         generator = ReportGenerator(client, logger=logger.info)
-        max_tokens = int(config.get('max_tokens', 128000))
-        logger.info(f"本地输入采样预算: {max_tokens} tokens（不等于 API 输出上限）")
+        configured_max_tokens = int(config.get('max_tokens', 128000))
+        max_tokens = max(128000, min(configured_max_tokens, MAX_INPUT_TOKEN_BUDGET))
+        if configured_max_tokens != max_tokens:
+            logger.info(
+                f"输入预算已限制为 {max_tokens} tokens（可选范围 128k - 1200k）"
+            )
+        logger.info(
+            f"本地输入采样预算: {max_tokens} tokens（不等于 API 输出上限；"
+            f"单次 API 请求最多约 {SAFE_API_SEGMENT_TOKEN_BUDGET} tokens）"
+        )
+
+        configured_concurrency = int(config.get('max_concurrency', DEFAULT_MAP_CONCURRENCY))
+        map_concurrency = max(1, min(configured_concurrency, MAX_MAP_CONCURRENCY))
+        if configured_concurrency != map_concurrency:
+            logger.info(
+                f"Map 并发数已限制为 {map_concurrency}（可选范围 1 - {MAX_MAP_CONCURRENCY}）"
+            )
+        logger.info(f"Map 并发请求数: {map_concurrency}")
 
         # Step 1: Map (Quarterly/Periodic Analysis)
         logger.info("正在进行切分...")
-        splits = analyzer.get_quarterly_splits()
+        splits = analyzer.get_quarterly_splits(selected_years or None)
         
         # Detect if it's a periodic split (non-full year)
-        is_periodic = False
+        is_periodic = bool(selected_years and len(selected_years) > 1)
         if splits and any(k.startswith("Period_") for k in splits.keys()):
             is_periodic = True
             logger.info("检测到非完整年度数据，启用阶段性分析模式")
-        
-        quarterly_results = []
         
         total_quarters = len(splits)
         if total_quarters == 0:
@@ -194,6 +376,7 @@ def run_analysis_task(task_id, file_path, config):
             splits = {"Whole_Year": df}
             total_quarters = 1
 
+        map_jobs = []
         processed_count = 0
         for q_name, q_df in splits.items():
             processed_count += 1
@@ -208,10 +391,57 @@ def run_analysis_task(task_id, file_path, config):
             # Use smart_sample from global scope instead of q_analyzer method
             sample_text = smart_sample(q_df, max_tokens, logger)
             
-            # Generate
-            logger.info(f"发送 AI 请求: {q_name} (Model: {model_map})")
-            res = generator.generate_quarterly_analysis(q_name, sample_text, model=model_map, is_periodic=is_periodic)
-            quarterly_results.append(res)
+            # Keep each request below the tested provider capacity. A larger
+            # selected budget is handled as multiple chronological Map segments.
+            segment_budget = min(max_tokens, SAFE_API_SEGMENT_TOKEN_BUDGET)
+            segments = split_text_by_token_budget(sample_text, segment_budget)
+            if len(segments) > 1:
+                logger.info(
+                    f"{q_name} 内容超过单次 API 容量，分为 {len(segments)} 段发送 "
+                    f"（每段不超过约 {segment_budget} tokens）"
+                )
+
+            for segment_index, segment_text in enumerate(segments, start=1):
+                segment_name = q_name
+                if len(segments) > 1:
+                    segment_name = f"{q_name}（第 {segment_index}/{len(segments)} 段）"
+
+                map_jobs.append({
+                    'order': len(map_jobs),
+                    'name': segment_name,
+                    'text': segment_text,
+                    'is_segmented': len(segments) > 1,
+                })
+
+        def run_map_job(job):
+            segment_name = job['name']
+            logger.info(f"发送 AI 请求: {segment_name} (Model: {model_map})")
+            result = generator.generate_quarterly_analysis(
+                segment_name,
+                job['text'],
+                model=model_map,
+                is_periodic=is_periodic,
+            )
+            if job['is_segmented'] and isinstance(result, dict):
+                result = dict(result)
+                result['_source_segment'] = segment_name
+            return job['order'], result
+
+        quarterly_results = [None] * len(map_jobs)
+        if map_jobs:
+            logger.info(f"开始并行执行 {len(map_jobs)} 个 Map 请求")
+            with ThreadPoolExecutor(max_workers=map_concurrency) as executor:
+                futures = [executor.submit(run_map_job, job) for job in map_jobs]
+                completed_jobs = 0
+                for future in as_completed(futures):
+                    job_order, result = future.result()
+                    quarterly_results[job_order] = result
+                    completed_jobs += 1
+                    progress = 50 + int(completed_jobs / len(map_jobs) * 30)
+                    logger.progress(
+                        progress,
+                        f"Map 分析完成 ({completed_jobs}/{len(map_jobs)})..."
+                    )
             
         # Step 2: Reduce (Annual/Periodic Report)
         logger.progress(85, "正在生成汇总报告...")
@@ -220,7 +450,14 @@ def run_analysis_task(task_id, file_path, config):
         global_stats_simple = {
             'total_messages': stats.get('total_messages'),
             'total_users': stats.get('total_users'),
-            'year': analyzer.get_target_year(),
+            'year': (
+                str(selected_years[0])
+                if len(selected_years) == 1
+                else '、'.join(map(str, selected_years))
+                if selected_years
+                else analyzer.get_target_year()
+            ),
+            'selected_years': selected_years,
             'active_users_count': stats.get('active_users_count', 0), # Added safely
             'silent_users_count': stats.get('silent_users_count', 0), # Added safely
             'top_talkers': stats.get('top_talkers', []), # Added safely
@@ -302,14 +539,148 @@ def run_analysis_task(task_id, file_path, config):
         if os.path.exists(file_path):
             os.remove(file_path)
 
+
+def start_analysis_task(file_path, config):
+    """Create and launch an analysis task for an already-saved JSON file."""
+    task_id = str(uuid.uuid4())
+    tasks[task_id] = {
+        'state': 'queued',
+        'progress': 0,
+        'status_text': '等待队列...',
+        'logs': [],
+        'result_url': None,
+        'error': None
+    }
+
+    thread = threading.Thread(
+        target=run_analysis_task,
+        args=(task_id, file_path, config),
+        daemon=True,
+    )
+    thread.start()
+    return task_id
+
+
 # --- Routes ---
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
+
+@app.route('/api/inspect', methods=['POST'])
+def inspect_file():
+    """Upload and inspect a chat export before starting AI analysis."""
+    cleanup_pending_uploads()
+
+    if 'file' not in request.files:
+        return jsonify({'status': 'error', 'message': 'No file part'}), 400
+
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'status': 'error', 'message': 'No selected file'}), 400
+    if not allowed_file(file.filename):
+        return jsonify({'status': 'error', 'message': 'Invalid file type'}), 400
+
+    filename = secure_filename(file.filename) or 'chat.json'
+    inspection_id = str(uuid.uuid4())
+    save_path = os.path.join(
+        app.config['UPLOAD_FOLDER'],
+        f"inspection_{inspection_id}_{filename}"
+    )
+
+    try:
+        file.save(save_path)
+        with open(save_path, 'r', encoding='utf-8') as handle:
+            content = handle.read()
+
+        df, meta = QQChatParser().parse_json(content)
+        years = get_year_summary(df)
+        if not years:
+            raise ValueError('没有识别到带有效时间的聊天记录')
+
+        default_year = max(
+            years,
+            key=lambda item: (item['message_count'], item['year'])
+        )['year']
+
+        with pending_uploads_lock:
+            pending_uploads[inspection_id] = {
+                'file_path': save_path,
+                'filename': filename,
+                'years': [item['year'] for item in years],
+                'created_at': time.time(),
+            }
+
+        return jsonify({
+            'status': 'success',
+            'inspection_id': inspection_id,
+            'chat_name': meta.get('chat_name'),
+            'total_messages': len(df),
+            'years': years,
+            'default_year': default_year,
+        })
+    except Exception as exc:
+        if os.path.exists(save_path):
+            os.remove(save_path)
+        return jsonify({
+            'status': 'error',
+            'message': f'文件识别失败: {exc}',
+        }), 400
+
+
 @app.route('/api/analyze', methods=['POST'])
 def analyze():
+    # New two-step flow: use an inspected upload and an explicit year selection.
+    if request.is_json:
+        request_data = request.get_json(silent=True) or {}
+        inspection_id = request_data.get('inspection_id')
+        if inspection_id:
+            config = request_data.get('config') or {}
+            selected_years = normalize_years(request_data.get('selected_years'))
+            if not isinstance(config, dict):
+                return jsonify({'status': 'error', 'message': 'Invalid config'}), 400
+            if not selected_years:
+                return jsonify({'status': 'error', 'message': '请至少选择一个年份'}), 400
+
+            cleanup_pending_uploads()
+            with pending_uploads_lock:
+                pending = pending_uploads.get(inspection_id)
+
+            if not pending:
+                return jsonify({
+                    'status': 'error',
+                    'message': '文件识别已过期，请重新上传文件',
+                }), 400
+
+            available_years = set(pending['years'])
+            invalid_years = [
+                year for year in selected_years if year not in available_years
+            ]
+            if invalid_years:
+                return jsonify({
+                    'status': 'error',
+                    'message': f"所选年份无效: {', '.join(map(str, invalid_years))}",
+                }), 400
+
+            with pending_uploads_lock:
+                pending = pending_uploads.pop(inspection_id, None)
+            if not pending:
+                return jsonify({
+                    'status': 'error',
+                    'message': '该文件已经开始分析或已失效，请重新上传',
+                }), 400
+
+            config = dict(config)
+            config['selected_years'] = selected_years
+            try:
+                task_id = start_analysis_task(pending['file_path'], config)
+            except Exception:
+                if os.path.exists(pending['file_path']):
+                    os.remove(pending['file_path'])
+                raise
+            return jsonify({'status': 'success', 'task_id': task_id})
+
     if 'file' not in request.files:
         return jsonify({'status': 'error', 'message': 'No file part'})
     
@@ -326,21 +697,7 @@ def analyze():
             task_id = str(uuid.uuid4())
             save_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{task_id}_{filename}")
             file.save(save_path)
-            
-            # Initialize Task
-            tasks[task_id] = {
-                'state': 'queued',
-                'progress': 0,
-                'status_text': '等待队列...',
-                'logs': [],
-                'result_url': None,
-                'error': None
-            }
-            
-            # Start Thread
-            thread = threading.Thread(target=run_analysis_task, args=(task_id, save_path, config))
-            thread.daemon = True
-            thread.start()
+            task_id = start_analysis_task(save_path, config)
             
             return jsonify({'status': 'success', 'task_id': task_id})
             
@@ -434,5 +791,16 @@ def download_file(filename):
     return send_from_directory(OUTPUT_FOLDER, filename, as_attachment=True)
 
 if __name__ == '__main__':
-    print("Starting Flask Server at http://localhost:5000")
-    app.run(debug=True, port=5000)
+    debug_enabled = os.environ.get('QQ_ANALYZER_DEBUG', '').lower() in {
+        '1', 'true', 'yes', 'on'
+    }
+    print(
+        f"Starting Flask Server at http://localhost:5000 "
+        f"(debug={debug_enabled}, reloader={debug_enabled})"
+    )
+    app.run(
+        debug=debug_enabled,
+        use_reloader=debug_enabled,
+        threaded=True,
+        port=5000,
+    )

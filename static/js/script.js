@@ -5,6 +5,8 @@ document.addEventListener('DOMContentLoaded', () => {
     loadConfig();
 });
 
+let pendingInspectionId = null;
+
 function initUI() {
     console.log("Initializing UI...");
     // 1. Sidebar Toggles
@@ -56,6 +58,15 @@ function initUI() {
         }
     }
 
+    // 4.1 Map Concurrency Slider
+    const concurrencySlider = document.getElementById('max-concurrency');
+    const concurrencyOutput = document.getElementById('concurrency-val');
+    if (concurrencySlider && concurrencyOutput) {
+        concurrencySlider.oninput = function() {
+            concurrencyOutput.innerHTML = this.value;
+        }
+    }
+
     // 5. File Upload Drag & Drop
     const dropZone = document.getElementById('upload-zone');
     const fileInput = document.getElementById('file-input');
@@ -84,6 +95,20 @@ function initUI() {
         fileInput.addEventListener('change', (e) => handleFiles(e.target.files));
     }
 
+    const selectAllYears = document.getElementById('select-all-years');
+    const yearOptions = document.getElementById('year-options');
+    const confirmYearsBtn = document.getElementById('confirm-years-btn');
+    if (selectAllYears && yearOptions && confirmYearsBtn) {
+        selectAllYears.addEventListener('change', () => {
+            yearOptions.querySelectorAll('.year-checkbox').forEach((checkbox) => {
+                checkbox.checked = selectAllYears.checked;
+            });
+            updateYearSelectionState();
+        });
+        yearOptions.addEventListener('change', updateYearSelectionState);
+        confirmYearsBtn.addEventListener('click', startSelectedAnalysis);
+    }
+
     // 6. Tutorial Modal (Markdown)
     const tutorialOutput = document.getElementById('tutorial-output');
     
@@ -110,9 +135,11 @@ function initUI() {
 
 ### 分析参数： 
 **Token预算**：取决于你所配置的模型的上下文长度，你填入的模型的上下文长度越大，那么可使用的预算就可以 *手动* 调至更多。例如： 
-> ***Gemini-3-pro-preview***的上下文长度是 *1M* ，那么你就可以将token预算拉满到 *950k* （剩下的50k预算留给提示词与冗余空间）<br>而***官方Deepseek-v3.2***的上下文长度是 *128k* ，那么你就可以将token预算拉到 *120k* <br>（同理，8k作为冗余） 
+> ***Gemini-3-pro-preview***的上下文长度是 *1M* ，那么你就可以将token预算拉满到 *900k* （剩下的100k预算留给提示词与冗余空间）<br>而***官方Deepseek-v3.2***的上下文长度是 *128k* ，那么你就可以将token预算拉到 *120k* <br>（同理，8k作为冗余）
 
 ##### *预算上限暂不支持grok的2M上下文。 
+
+当单次输入超过当前接口容量时，工具会自动按聊天记录分段发送并汇总结果。
 
 **动漫小剧场主题**：可以选择预设的两种主题，也可以自定义主题。选择后可以在报告上生成一段将群友带入该主题角色的小剧场，*纯私货，纯整活，ooc可能性存微。* 
 
@@ -131,8 +158,8 @@ function initUI() {
 **第二步：配置 AI** 
 <br>点击左上角“API 配置”，填入自定义的LLM API配置，以及开启需要的功能。 
 
-**第三步：上传分析** 
-<br>将 JSON 文件拖入中央区域，等待分析完成。 
+**第三步：上传并选择年份**
+<br>将 JSON 文件拖入中央区域，先选择需要分析的一个或多个年份，再点击开始分析。
 
 **第四步：获取报告** 
 <br>进度条走完后，点击下载按钮保存 HTML 报告。 
@@ -158,13 +185,30 @@ function handleDrop(e) {
 
 function handleFiles(files) {
     if (files.length > 0) {
-        uploadFile(files[0]);
+        inspectFile(files[0]);
     }
 }
 
 // --- Core Logic ---
 
-async function uploadFile(file) {
+function getAnalysisConfig() {
+    return {
+        mode: document.getElementById('llm-mode').value,
+        base_url: document.getElementById('api-base').value,
+        api_key: document.getElementById('api-key').value,
+        model: document.getElementById('model-name').value,
+        model_map: document.getElementById('model-map').value,
+        model_reduce: document.getElementById('model-reduce').value,
+        model_refine: document.getElementById('model-refine').value,
+        max_tokens: parseInt(document.getElementById('sampling-strength').value),
+        max_concurrency: parseInt(document.getElementById('max-concurrency').value),
+        anime_theme: document.getElementById('anime-theme').value,
+        custom_theme_prompt: document.getElementById('custom-theme-prompt').value,
+        enhance_mode: document.getElementById('enhance-mode').checked
+    };
+}
+
+async function inspectFile(file) {
     if (!file.name.endsWith('.json')) {
         alert("请上传 JSON 文件！");
         return;
@@ -174,58 +218,144 @@ async function uploadFile(file) {
     const statusContainer = document.getElementById('status-container');
     const progressBar = document.getElementById('progress-fill');
     const statusMsg = document.getElementById('status-msg');
+    const percentSpan = document.getElementById('status-percent');
     const logBox = document.getElementById('log-box');
     const resultActions = document.getElementById('result-actions');
+    const yearSelection = document.getElementById('year-selection');
 
+    pendingInspectionId = null;
     statusContainer.style.display = 'block';
     resultActions.style.display = 'none';
+    yearSelection.style.display = 'none';
     progressBar.style.width = '0%';
+    percentSpan.innerText = '0%';
+    statusMsg.style.color = '#666';
     logBox.innerHTML = '';
-    
-    // Gather Config
-    const config = {
-        mode: document.getElementById('llm-mode').value,
-        base_url: document.getElementById('api-base').value,
-        api_key: document.getElementById('api-key').value,
-        model: document.getElementById('model-name').value,
-        model_map: document.getElementById('model-map').value,
-        model_reduce: document.getElementById('model-reduce').value,
-        model_refine: document.getElementById('model-refine').value,
-        max_tokens: parseInt(document.getElementById('sampling-strength').value),
-        anime_theme: document.getElementById('anime-theme').value,
-        custom_theme_prompt: document.getElementById('custom-theme-prompt').value,
-        enhance_mode: document.getElementById('enhance-mode').checked
-    };
 
     const formData = new FormData();
     formData.append('file', file);
-    formData.append('config', JSON.stringify(config));
 
     try {
-        statusMsg.innerText = "正在上传并启动分析...";
-        log("系统: 开始上传文件...");
+        statusMsg.innerText = "正在上传并识别年份...";
+        log("系统: 开始上传文件并解析时间分片...");
         
-        const response = await fetch('/api/analyze', {
+        const response = await fetch('/api/inspect', {
             method: 'POST',
             body: formData
         });
 
         const data = await response.json();
         
-        if (data.status === 'error') {
+        if (!response.ok || data.status === 'error') {
             throw new Error(data.message);
         }
 
-        const taskId = data.task_id;
-        log(`系统: 任务已创建 [ID: ${taskId}]`);
-        
-        // Start Polling
-        pollProgress(taskId);
+        pendingInspectionId = data.inspection_id;
+        renderYearSelection(data);
+        progressBar.style.width = '100%';
+        percentSpan.innerText = '已识别';
+        statusMsg.innerText = `已识别 ${data.years.length} 个年份，请选择后开始分析`;
+        log(`系统: 已识别 ${data.total_messages} 条消息，发现 ${data.years.length} 个年份`);
 
     } catch (error) {
         console.error(error);
         statusMsg.innerText = "❌ 发生错误";
         statusMsg.style.color = "red";
+        log(`ERROR: ${error.message}`);
+    }
+}
+
+function renderYearSelection(data) {
+    const yearSelection = document.getElementById('year-selection');
+    const summary = document.getElementById('year-selection-summary');
+    const yearOptions = document.getElementById('year-options');
+    const selectAllYears = document.getElementById('select-all-years');
+
+    const years = Array.isArray(data.years) ? data.years : [];
+    summary.innerText = `${data.chat_name || '未命名聊天'} · 共 ${Number(data.total_messages || 0).toLocaleString()} 条消息`;
+    yearOptions.innerHTML = years.map((item) => {
+        const year = Number(item.year);
+        const checked = year === Number(data.default_year) ? ' checked' : '';
+        const start = String(item.start_time || '').slice(0, 10);
+        const end = String(item.end_time || '').slice(0, 10);
+        const count = Number(item.message_count || 0).toLocaleString();
+        return `
+            <div class="year-option">
+                <label class="year-option-label">
+                    <input type="checkbox" class="year-checkbox" value="${year}"${checked}>
+                    <span>${year}</span>
+                </label>
+                <span class="year-option-meta">${count} 条 · ${start} 至 ${end}</span>
+            </div>`;
+    }).join('');
+
+    selectAllYears.checked = false;
+    document.getElementById('confirm-years-btn').innerText = '▶ 开始 AI 分析';
+    yearSelection.style.display = 'block';
+    updateYearSelectionState();
+}
+
+function updateYearSelectionState() {
+    const yearOptions = document.getElementById('year-options');
+    const selectAllYears = document.getElementById('select-all-years');
+    const confirmYearsBtn = document.getElementById('confirm-years-btn');
+    if (!yearOptions || !selectAllYears || !confirmYearsBtn) return;
+
+    const checkboxes = Array.from(yearOptions.querySelectorAll('.year-checkbox'));
+    const selectedCount = checkboxes.filter((checkbox) => checkbox.checked).length;
+    selectAllYears.checked = checkboxes.length > 0 && selectedCount === checkboxes.length;
+    selectAllYears.indeterminate = selectedCount > 0 && selectedCount < checkboxes.length;
+    confirmYearsBtn.disabled = selectedCount === 0 || !pendingInspectionId;
+}
+
+async function startSelectedAnalysis() {
+    const confirmYearsBtn = document.getElementById('confirm-years-btn');
+    const statusMsg = document.getElementById('status-msg');
+    const progressBar = document.getElementById('progress-fill');
+    const percentSpan = document.getElementById('status-percent');
+    const yearSelection = document.getElementById('year-selection');
+    const selectedYears = Array.from(
+        document.querySelectorAll('#year-options .year-checkbox:checked')
+    ).map((checkbox) => Number(checkbox.value));
+
+    if (!pendingInspectionId || selectedYears.length === 0) {
+        alert('请至少选择一个年份');
+        return;
+    }
+
+    confirmYearsBtn.disabled = true;
+    confirmYearsBtn.innerText = '⏳ 正在启动分析...';
+    statusMsg.innerText = '正在启动 AI 分析...';
+    statusMsg.style.color = '#666';
+    progressBar.style.width = '0%';
+    percentSpan.innerText = '0%';
+
+    try {
+        const response = await fetch('/api/analyze', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                inspection_id: pendingInspectionId,
+                selected_years: selectedYears,
+                config: getAnalysisConfig()
+            })
+        });
+        const data = await response.json();
+        if (!response.ok || data.status === 'error') {
+            throw new Error(data.message);
+        }
+
+        const taskId = data.task_id;
+        pendingInspectionId = null;
+        yearSelection.style.display = 'none';
+        log(`系统: 任务已创建 [ID: ${taskId}]，年份: ${selectedYears.join('、')}`);
+        pollProgress(taskId);
+    } catch (error) {
+        console.error(error);
+        confirmYearsBtn.disabled = false;
+        confirmYearsBtn.innerText = '▶ 开始 AI 分析';
+        statusMsg.innerText = '❌ 启动失败';
+        statusMsg.style.color = 'red';
         log(`ERROR: ${error.message}`);
     }
 }
@@ -335,6 +465,11 @@ async function loadConfig() {
             document.getElementById('sampling-strength').value = config.max_tokens;
             document.getElementById('token-val').innerText = config.max_tokens;
         }
+        if (config.max_concurrency) {
+            const concurrency = Math.min(16, Math.max(1, Number(config.max_concurrency)));
+            document.getElementById('max-concurrency').value = concurrency;
+            document.getElementById('concurrency-val').innerText = concurrency;
+        }
         if (config.anime_theme) {
             document.getElementById('anime-theme').value = config.anime_theme;
             toggleCustomTheme();
@@ -352,19 +487,7 @@ async function loadConfig() {
 }
 
 async function saveConfig(successMsg = '✅ 配置已保存') {
-    const config = {
-        mode: document.getElementById('llm-mode').value,
-        base_url: document.getElementById('api-base').value,
-        api_key: document.getElementById('api-key').value,
-        model: document.getElementById('model-name').value,
-        model_map: document.getElementById('model-map').value,
-        model_reduce: document.getElementById('model-reduce').value,
-        model_refine: document.getElementById('model-refine').value,
-        max_tokens: parseInt(document.getElementById('sampling-strength').value),
-        anime_theme: document.getElementById('anime-theme').value,
-        custom_theme_prompt: document.getElementById('custom-theme-prompt').value,
-        enhance_mode: document.getElementById('enhance-mode').checked
-    };
+    const config = getAnalysisConfig();
 
     try {
         const res = await fetch('/api/config', {

@@ -181,12 +181,15 @@ class ChatAnalyzer:
         
         return Counter(filtered_words).most_common(top_n)
 
-    def get_quarterly_splits(self) -> Dict[str, pd.DataFrame]:
+    def get_quarterly_splits(self, years: List[int] = None) -> Dict[str, pd.DataFrame]:
         """
         智能切分策略：
         1. 首先尝试按自然季度切分。
         2. 检查数据分布是否极度不均（如集中在某一个季度）或时间跨度过短。
         3. 如果满足条件，切换为“等量分块模式”，将数据按消息量均分为 4 份。
+
+        When years is provided, explicitly split every selected year instead of
+        silently choosing the year with the most messages.
         """
         if self.df.empty:
             return {}
@@ -194,6 +197,14 @@ class ChatAnalyzer:
         # 确保 datetime 列是 datetime 类型
         if not pd.api.types.is_datetime64_any_dtype(self.df[COL_DATETIME]):
              self.df[COL_DATETIME] = pd.to_datetime(self.df[COL_DATETIME])
+
+        if years is not None:
+            selected_years = sorted({int(year) for year in years})
+            if not selected_years:
+                return {}
+            self.selected_years = selected_years
+            self.target_year = selected_years[-1]
+            return self._get_selected_year_splits(selected_years)
         
         # 1. 找到消息最多的年份
         year_counts = self.df[COL_DATETIME].dt.year.value_counts()
@@ -215,7 +226,8 @@ class ChatAnalyzer:
         splits['First_quarter'] = self.df[(self.df[COL_DATETIME] >= q1_start) & (self.df[COL_DATETIME] < q2_start)].copy()
         splits['Second_quarter'] = self.df[(self.df[COL_DATETIME] >= q2_start) & (self.df[COL_DATETIME] < q3_start)].copy()
         splits['Third_quarter'] = self.df[(self.df[COL_DATETIME] >= q3_start) & (self.df[COL_DATETIME] < q4_start)].copy()
-        splits['Fourth_quarter'] = self.df[(self.df[COL_DATETIME] >= q4_start)].copy()
+        q4_end = pd.Timestamp(f"{target_year + 1}-01-01", tz=tz)
+        splits['Fourth_quarter'] = self.df[(self.df[COL_DATETIME] >= q4_start) & (self.df[COL_DATETIME] < q4_end)].copy()
         
         # 3. 智能检测机制
         total_msgs = len(self.df)
@@ -240,6 +252,36 @@ class ChatAnalyzer:
             # 切换到动态等量切分
             return self._get_dynamic_splits(4)
             
+        return splits
+
+    def _get_selected_year_splits(self, years: List[int]) -> Dict[str, pd.DataFrame]:
+        """Split explicitly selected years into bounded natural quarters."""
+        tz = self.df[COL_DATETIME].dt.tz
+        multiple_years = len(years) > 1
+        splits = {}
+        year_series = self.df[COL_DATETIME].dt.year
+        quarter_definitions = (
+            ('First_quarter', 1, 4),
+            ('Second_quarter', 4, 7),
+            ('Third_quarter', 7, 10),
+            ('Fourth_quarter', 10, 1),
+        )
+
+        for year in years:
+            year_df = self.df[year_series == year]
+            if year_df.empty:
+                continue
+
+            for quarter_name, start_month, next_month in quarter_definitions:
+                start = pd.Timestamp(f"{year}-{start_month:02d}-01", tz=tz)
+                end_year = year + 1 if next_month == 1 else year
+                end = pd.Timestamp(f"{end_year}-{next_month:02d}-01", tz=tz)
+                key = f"{year}_{quarter_name}" if multiple_years else quarter_name
+                splits[key] = year_df[
+                    (year_df[COL_DATETIME] >= start) &
+                    (year_df[COL_DATETIME] < end)
+                ].copy()
+
         return splits
 
     def _get_dynamic_splits(self, n_splits: int = 4) -> Dict[str, pd.DataFrame]:

@@ -143,6 +143,89 @@ body {
     color: #666;
 }
 
+/* Year Selection */
+.year-selection {
+    width: 100%;
+    max-width: 600px;
+    margin-top: 1.5rem;
+    background: white;
+    border: 1px solid #F0DADA;
+    border-radius: 8px;
+    padding: 1.25rem;
+    box-sizing: border-box;
+}
+
+.year-selection-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+}
+
+.year-selection-header h3 {
+    margin: 0 0 0.35rem;
+    color: var(--primary-color);
+    font-size: 1.1rem;
+}
+
+.year-selection-summary {
+    color: #777;
+    font-size: 0.85rem;
+    line-height: 1.5;
+}
+
+.year-select-all {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: #555;
+    font-size: 0.85rem;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.year-options {
+    display: grid;
+    gap: 0.6rem;
+    margin-top: 1rem;
+}
+
+.year-option {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 1rem;
+    padding: 0.75rem;
+    border: 1px solid #EEEEEE;
+    border-radius: 6px;
+    background: #FAFAFA;
+}
+
+.year-option:hover {
+    border-color: #FFBABA;
+    background: #FFF9F9;
+}
+
+.year-option-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    color: #333;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.year-option-meta {
+    color: #888;
+    font-size: 0.8rem;
+    text-align: right;
+}
+
+.year-selection-footer {
+    margin-top: 1rem;
+}
+
 /* Progress & Status */
 .status-container {
     width: 100%;

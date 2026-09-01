@@ -58,14 +58,24 @@
 
         <div class="sidebar-title" style="margin-top: 2rem;">🎛️ 分析参数</div>
         <div class="form-group">
-            <label class="form-label">Token 预算 (128k - 950k) 
+            <label class="form-label">Token 预算 (128k - 1200k)
                 <span title="Token 预算决定了发送给 AI 的上下文长度。预算越高，AI 看到的聊天记录越多，分析越全面，但消耗的时间和费用也会增加。" style="cursor:help; font-size:1rem;">💡</span>
             </label>
-            <input type="range" id="sampling-strength" min="128000" max="950000" step="1000" value="128000" style="width:100%">
+            <input type="range" id="sampling-strength" min="128000" max="1200000" step="1000" value="128000" style="width:100%">
             <div style="text-align:right; font-size:0.8rem; color:#666;" id="token-val">128000</div>
             <p style="font-size: 0.75rem; color: #888; margin-top: 5px;">
                 Token 是 AI 处理文本的基本单位（约 0.75 个单词或 1 个汉字）。<br>
-                预算越高 = 分析越深入 + 费用越高。
+                预算越高 = 分析越深入 + 费用越高。超过单次接口容量时会自动分段分析。
+            </p>
+        </div>
+        <div class="form-group">
+            <label class="form-label">并发请求数 (1 - 16)
+                <span title="同时发送的 Map 分析请求数量。并发越高速度越快，但更容易触发服务商限流。" style="cursor:help; font-size:1rem;">💡</span>
+            </label>
+            <input type="range" id="max-concurrency" min="1" max="16" step="1" value="2" style="width:100%">
+            <div style="text-align:right; font-size:0.8rem; color:#666;" id="concurrency-val">2</div>
+            <p style="font-size: 0.75rem; color: #888; margin-top: 5px;">
+                建议使用 2 - 4 路；Reduce 汇总会等待所有 Map 请求完成。
             </p>
         </div>
         <div class="form-group">
@@ -126,6 +136,26 @@
             <input type="file" id="file-input" accept=".json" style="display: none;">
         </div>
 
+        <!-- Year selection appears after the file has been parsed. -->
+        <section id="year-selection" class="year-selection" style="display: none;" aria-live="polite">
+            <div class="year-selection-header">
+                <div>
+                    <h3>选择分析年份</h3>
+                    <div id="year-selection-summary" class="year-selection-summary"></div>
+                </div>
+                <label class="year-select-all">
+                    <input type="checkbox" id="select-all-years">
+                    <span>全选</span>
+                </label>
+            </div>
+            <div id="year-options" class="year-options"></div>
+            <div class="year-selection-footer">
+                <button id="confirm-years-btn" type="button" class="btn-primary" disabled>
+                    ▶ 开始 AI 分析
+                </button>
+            </div>
+        </section>
+
         <!-- Progress Area -->
         <div id="status-container" class="status-container">
             <div class="status-text">
@@ -155,6 +185,6 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <script src="/static/js/script.js?v=3"></script>
+    <script src="/static/js/script.js?v=4"></script>
 </body>
 </html>
