@@ -226,6 +226,18 @@ body {
     margin-top: 1rem;
 }
 
+.report-mode-row {
+    display: grid;
+    gap: 0.45rem;
+    margin-top: 1rem;
+}
+
+.report-mode-row label {
+    color: #555;
+    font-size: 0.85rem;
+    font-weight: 600;
+}
+
 /* Progress & Status */
 .status-container {
     width: 100%;
@@ -267,6 +279,17 @@ body {
     font-size: 0.85rem;
     height: 150px;
     overflow-y: auto;
+}
+
+.result-links {
+    display: grid;
+    gap: 0.6rem;
+}
+
+.result-links .btn-primary {
+    display: block;
+    text-align: center;
+    text-decoration: none;
 }
 
 /* Form Elements */

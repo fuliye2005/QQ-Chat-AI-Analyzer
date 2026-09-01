@@ -162,7 +162,7 @@ function initUI() {
 <br>将 JSON 文件拖入中央区域，先选择需要分析的一个或多个年份，再点击开始分析。
 
 **第四步：获取报告** 
-<br>进度条走完后，点击下载按钮保存 HTML 报告。 
+<br>进度条走完后，按选择的模式下载各年份报告或多年集合报告。
 
 ### 感谢你看到这里，也感谢使用本工具喵~<br>若觉得用着顺手记得点赞转发哦，若有建议和意见欢迎联系开发者反馈喵。`;
 
@@ -202,6 +202,7 @@ function getAnalysisConfig() {
         model_refine: document.getElementById('model-refine').value,
         max_tokens: parseInt(document.getElementById('sampling-strength').value),
         max_concurrency: parseInt(document.getElementById('max-concurrency').value),
+        report_mode: document.getElementById('report-mode')?.value || 'per_year',
         anime_theme: document.getElementById('anime-theme').value,
         custom_theme_prompt: document.getElementById('custom-theme-prompt').value,
         enhance_mode: document.getElementById('enhance-mode').checked
@@ -365,7 +366,6 @@ async function pollProgress(taskId) {
     const statusMsg = document.getElementById('status-msg');
     const percentSpan = document.getElementById('status-percent');
     const resultActions = document.getElementById('result-actions');
-    const downloadBtn = document.getElementById('download-btn');
 
     const interval = setInterval(async () => {
         try {
@@ -387,7 +387,7 @@ async function pollProgress(taskId) {
                 clearInterval(interval);
                 statusMsg.innerText = "✅ 分析完成！";
                 resultActions.style.display = 'block';
-                downloadBtn.href = data.result_url;
+                renderResultLinks(data);
                 loadHistory(); // Refresh history
             } else if (data.state === 'failed') {
                 clearInterval(interval);
@@ -400,6 +400,34 @@ async function pollProgress(taskId) {
             console.error("Polling error", e);
         }
     }, 1000);
+}
+
+function renderResultLinks(data) {
+    const resultLinks = document.getElementById('result-links');
+    if (!resultLinks) return;
+
+    let reports = Array.isArray(data.result_urls) ? data.result_urls : [];
+    if (reports.length === 0 && data.result_url) {
+        reports = [{
+            label: '下载 HTML 报告',
+            url: data.result_url,
+        }];
+    }
+
+    resultLinks.innerHTML = '';
+    reports.forEach((report) => {
+        if (!report || !report.url) return;
+        const link = document.createElement('a');
+        link.href = report.url;
+        link.target = '_blank';
+        link.className = 'btn-primary';
+        link.innerText = `📥 ${report.label || '下载 HTML 报告'}`;
+        resultLinks.appendChild(link);
+    });
+
+    if (resultLinks.childElementCount === 0) {
+        resultLinks.innerText = '报告文件未找到';
+    }
 }
 
 function log(msg) {
@@ -431,9 +459,11 @@ async function loadHistory() {
             div.style.padding = '10px';
             div.style.borderBottom = '1px solid #eee';
             div.style.cursor = 'pointer';
+            const yearLabel = r.year ? ` · ${r.year} 年` : '';
+            const modeLabel = r.report_mode === 'combined' ? ' · 集合报告' : '';
             
             div.innerHTML = `
-                <div style="font-weight:bold; color:#333;">${r.chat_name || '未命名群聊'}</div>
+                <div style="font-weight:bold; color:#333;">${r.chat_name || '未命名群聊'}${yearLabel}${modeLabel}</div>
                 <div style="font-size:0.8rem; color:#666;">${r.timestamp}</div>
                 <div style="font-size:0.8rem; color:#999;">消息数: ${r.messages_count}</div>
                 <a href="/download/${r.report_path.split('\\').pop().split('/').pop()}" target="_blank" style="font-size:0.8rem; color:var(--primary-color);">查看报告</a>
@@ -469,6 +499,12 @@ async function loadConfig() {
             const concurrency = Math.min(16, Math.max(1, Number(config.max_concurrency)));
             document.getElementById('max-concurrency').value = concurrency;
             document.getElementById('concurrency-val').innerText = concurrency;
+        }
+        if (config.report_mode) {
+            const reportMode = document.getElementById('report-mode');
+            if (reportMode && ['per_year', 'combined', 'both'].includes(config.report_mode)) {
+                reportMode.value = config.report_mode;
+            }
         }
         if (config.anime_theme) {
             document.getElementById('anime-theme').value = config.anime_theme;

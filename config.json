@@ -8,6 +8,7 @@
   "model_refine": "",
   "max_tokens": 128000,
   "max_concurrency": 2,
+  "report_mode": "per_year",
   "request_timeout_seconds": 180,
   "request_max_output_tokens": 8000,
   "request_max_retries": 2,

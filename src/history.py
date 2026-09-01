@@ -33,7 +33,14 @@ class HistoryManager:
             with open(self.file_path, 'w', encoding='utf-8') as f:
                 json.dump([], f)
 
-    def add_record(self, chat_name: str, messages_count: int, report_path: str):
+    def add_record(
+        self,
+        chat_name: str,
+        messages_count: int,
+        report_path: str,
+        year: Optional[int] = None,
+        report_mode: Optional[str] = None,
+    ):
         """
         添加一条新的分析记录。
         """
@@ -42,12 +49,16 @@ class HistoryManager:
         # 关联: 分析完成后调用
         
         record = {
-            "id": datetime.now().strftime("%Y%m%d%H%M%S"),
+            "id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "chat_name": chat_name,
             "messages_count": messages_count,
             "report_path": report_path
         }
+        if year is not None:
+            record["year"] = int(year)
+        if report_mode:
+            record["report_mode"] = str(report_mode)
         
         records = self.get_records()
         records.insert(0, record) # 最新记录排前面

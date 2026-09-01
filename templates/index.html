@@ -149,6 +149,14 @@
                 </label>
             </div>
             <div id="year-options" class="year-options"></div>
+            <div class="report-mode-row">
+                <label for="report-mode">报告生成方式</label>
+                <select id="report-mode" class="form-select">
+                    <option value="per_year">每个年份分别生成（推荐）</option>
+                    <option value="combined">生成多年集合报告</option>
+                    <option value="both">分别生成年度报告和多年集合报告</option>
+                </select>
+            </div>
             <div class="year-selection-footer">
                 <button id="confirm-years-btn" type="button" class="btn-primary" disabled>
                     ▶ 开始 AI 分析
@@ -168,7 +176,7 @@
             <div id="log-box" class="log-box"></div>
             
             <div id="result-actions" style="margin-top: 1rem; display: none;">
-                <a id="download-btn" href="#" target="_blank" class="btn-primary" style="display:block; text-align:center; text-decoration:none;">📥 下载 HTML 报告</a>
+                <div id="result-links" class="result-links"></div>
             </div>
         </div>
     </main>
@@ -185,6 +193,6 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <script src="/static/js/script.js?v=4"></script>
+    <script src="/static/js/script.js?v=5"></script>
 </body>
 </html>

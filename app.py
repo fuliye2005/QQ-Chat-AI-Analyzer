@@ -36,6 +36,7 @@ SAFE_API_SEGMENT_TOKEN_BUDGET = 900_000
 DEFAULT_MAP_CONCURRENCY = 2
 MAX_MAP_CONCURRENCY = 16
 PENDING_UPLOAD_TTL_SECONDS = 3600
+INTERMEDIATE_FOLDER = os.path.join(OUTPUT_FOLDER, 'intermediate')
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -83,6 +84,15 @@ def normalize_years(values):
     return sorted(set(years))
 
 
+VALID_REPORT_MODES = {'per_year', 'combined', 'both'}
+
+
+def normalize_report_mode(value):
+    """Normalize the report output mode selected by the user."""
+    mode = str(value or 'per_year').strip().lower()
+    return mode if mode in VALID_REPORT_MODES else 'per_year'
+
+
 def get_year_summary(df):
     """Return JSON-serializable year ranges and message counts."""
     if df.empty:
@@ -115,6 +125,159 @@ def cleanup_pending_uploads():
     for file_path in expired_paths:
         if os.path.exists(file_path):
             os.remove(file_path)
+
+
+def make_json_safe(value):
+    """Convert pandas/numpy values and dates into JSON-serializable values."""
+    if isinstance(value, dict):
+        return {str(key): make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [make_json_safe(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if hasattr(value, 'item'):
+        try:
+            return make_json_safe(value.item())
+        except (ValueError, TypeError):
+            pass
+    if hasattr(value, 'isoformat'):
+        return value.isoformat()
+    return str(value)
+
+
+def build_year_context(df, meta, year):
+    """Build all non-AI report inputs for one calendar year."""
+    year = int(year)
+    year_df = df[df[COL_DATETIME].dt.year == year].copy()
+    if year_df.empty:
+        return None
+
+    analyzer = ChatAnalyzer(year_df)
+    stats = analyzer.get_basic_stats()
+    stats.update(meta)
+    stats['total_messages'] = len(year_df)
+    stats['selected_years'] = [year]
+    stats['start_time'] = year_df[COL_DATETIME].min().isoformat()
+    stats['end_time'] = year_df[COL_DATETIME].max().isoformat()
+
+    return {
+        'year': year,
+        'df': year_df,
+        'analyzer': analyzer,
+        'stats': stats,
+        'daily_activity': analyzer.get_daily_activity(),
+        'rankings': analyzer.get_user_rankings(),
+        'hardcore': analyzer.get_hardcore_stats(),
+    }
+
+
+def build_combined_context(df, meta, years):
+    """Build report inputs for a collection report spanning selected years."""
+    if df.empty:
+        return None
+
+    analyzer = ChatAnalyzer(df.copy())
+    stats = analyzer.get_basic_stats()
+    stats.update(meta)
+    stats['total_messages'] = len(df)
+    stats['selected_years'] = [int(year) for year in years]
+    stats['start_time'] = df[COL_DATETIME].min().isoformat()
+    stats['end_time'] = df[COL_DATETIME].max().isoformat()
+
+    return {
+        'years': [int(year) for year in years],
+        'df': df.copy(),
+        'analyzer': analyzer,
+        'stats': stats,
+        'daily_activity': analyzer.get_daily_activity(),
+        'rankings': analyzer.get_user_rankings(),
+        'hardcore': analyzer.get_hardcore_stats(),
+    }
+
+
+def serialize_year_context(context):
+    """Persist the non-AI inputs needed to render a yearly report later."""
+    return {
+        'stats': make_json_safe(context['stats']),
+        'daily_activity': make_json_safe(
+            context['daily_activity'].to_dict('records')
+        ),
+        'rankings': {
+            name: make_json_safe(frame.to_dict('records'))
+            for name, frame in context['rankings'].items()
+        },
+        'hardcore': make_json_safe(context['hardcore']),
+    }
+
+
+def save_intermediate_artifact(
+    task_id,
+    report_years,
+    map_results_by_year,
+    year_contexts,
+    status,
+    total_map_jobs,
+    completed_map_jobs,
+    report_mode='per_year',
+):
+    """Atomically save Map output so Reduce can be retried after a failure."""
+    os.makedirs(INTERMEDIATE_FOLDER, exist_ok=True)
+    artifact_path = os.path.join(INTERMEDIATE_FOLDER, f'{task_id}.json')
+    artifact = {
+        'version': 1,
+        'task_id': task_id,
+        'status': status,
+        'report_mode': normalize_report_mode(report_mode),
+        'report_years': [int(year) for year in report_years],
+        'completed_map_jobs': int(completed_map_jobs),
+        'total_map_jobs': int(total_map_jobs),
+        'map_results': make_json_safe(map_results_by_year),
+        'year_contexts': {
+            str(year): serialize_year_context(context)
+            for year, context in year_contexts.items()
+        },
+    }
+    temp_path = f'{artifact_path}.tmp'
+    with open(temp_path, 'w', encoding='utf-8') as handle:
+        json.dump(artifact, handle, ensure_ascii=False, indent=2)
+    os.replace(temp_path, artifact_path)
+    return artifact_path
+
+
+def load_intermediate_artifact(artifact_path):
+    """Read and validate a persisted Map artifact before Reduce."""
+    with open(artifact_path, 'r', encoding='utf-8') as handle:
+        artifact = json.load(handle)
+    if artifact.get('version') != 1:
+        raise ValueError('不支持的中间产物版本')
+    if not isinstance(artifact.get('map_results'), dict):
+        raise ValueError('中间产物缺少 Map 结果')
+    return artifact
+
+
+def build_reduce_stats(context, years):
+    """Build Reduce input from one year or a selected year collection."""
+    if isinstance(years, (list, tuple, set)):
+        selected_years = [int(year) for year in years]
+    else:
+        selected_years = [int(years)]
+
+    stats = context['stats']
+    hardcore = context.get('hardcore') or {}
+    return {
+        'total_messages': stats.get('total_messages', 0),
+        'total_users': stats.get('total_users', 0),
+        'year': '、'.join(map(str, selected_years)),
+        'selected_years': selected_years,
+        'active_users_count': stats.get(
+            'active_users_count', stats.get('total_users', 0)
+        ),
+        'silent_users_count': stats.get('silent_users_count', 0),
+        'top_talkers': hardcore.get('top_talkers', []),
+        'top_repeaters': stats.get('top_repeaters', []),
+        'hardcore': hardcore,
+    }
 
 class TaskLogger:
     def __init__(self, task_id):
@@ -266,6 +429,7 @@ def run_analysis_task(task_id, file_path, config):
         logger.info(f"解析成功: {len(df)} messages")
 
         selected_years = normalize_years(config.get('selected_years'))
+        report_mode = normalize_report_mode(config.get('report_mode'))
         if selected_years:
             available_years = {
                 int(year) for year in df[COL_DATETIME].dt.year.dropna().unique()
@@ -286,24 +450,35 @@ def run_analysis_task(task_id, file_path, config):
                 f"筛选后 {len(df)} messages"
             )
 
-        # 2. Analyze (Stats)
+        # 2. Analyze (Stats), keeping one independent report context per year.
         logger.progress(30, "正在进行统计分析...")
         analyzer = ChatAnalyzer(df)
-        stats = analyzer.get_basic_stats()
-        # Merge meta into stats if needed, or keep separate. 
-        # analyzer.get_basic_stats() returns dict. 
-        # meta contains chat_name.
-        stats.update(meta)
-        # The report should describe the selected subset, not the full source file.
-        stats['total_messages'] = len(df)
-        if selected_years:
-            stats['selected_years'] = selected_years
-            stats['start_time'] = df[COL_DATETIME].min().isoformat()
-            stats['end_time'] = df[COL_DATETIME].max().isoformat()
-        
-        daily_activity = analyzer.get_daily_activity()
+        report_years = selected_years or [int(analyzer.get_target_year())]
+        year_contexts = {}
+        for report_year in report_years:
+            context = build_year_context(df, meta, report_year)
+            if context:
+                year_contexts[int(report_year)] = context
+
+        if not year_contexts:
+            raise ValueError("没有可生成报告的有效年份")
+
+        report_years = [
+            int(year) for year in report_years if int(year) in year_contexts
+        ]
+        combined_df = df[df[COL_DATETIME].dt.year.isin(report_years)].copy()
+        combined_context = build_combined_context(
+            combined_df,
+            meta,
+            report_years,
+        )
+        if not combined_context:
+            raise ValueError("没有可生成集合报告的有效数据")
         logger.progress(40, "统计分析完成")
-        logger.info("基础统计完成")
+        logger.info(
+            f"已建立 {len(report_years)} 个年度报告上下文："
+            f"{', '.join(map(str, report_years))}；报告模式: {report_mode}"
+        )
 
         # 3. AI Analysis (Map-Reduce)
         logger.progress(45, "正在初始化 AI 分析组件...")
@@ -360,37 +535,52 @@ def run_analysis_task(task_id, file_path, config):
             )
         logger.info(f"Map 并发请求数: {map_concurrency}")
 
-        # Step 1: Map (Quarterly/Periodic Analysis)
+        # Step 1: Map (quarterly analysis grouped by report year)
         logger.info("正在进行切分...")
         splits = analyzer.get_quarterly_splits(selected_years or None)
-        
-        # Detect if it's a periodic split (non-full year)
-        is_periodic = bool(selected_years and len(selected_years) > 1)
-        if splits and any(k.startswith("Period_") for k in splits.keys()):
+
+        # Keep the old periodic Map prompt for the collection-report channel.
+        # Independent yearly reports always use the quarterly prompt.
+        is_periodic = report_mode == 'combined' and len(report_years) > 1
+        if not selected_years and splits and any(
+            key.startswith("Period_") for key in splits.keys()
+        ):
             is_periodic = True
             logger.info("检测到非完整年度数据，启用阶段性分析模式")
-        
-        total_quarters = len(splits)
-        if total_quarters == 0:
-            logger.info("切分失败，降级为全量分析")
-            splits = {"Whole_Year": df}
-            total_quarters = 1
+
+        if not splits:
+            logger.info("切分失败，按年度降级为全量分析")
+            splits = {
+                f"{year}_Whole_Year": context['df']
+                for year, context in year_contexts.items()
+            }
 
         map_jobs = []
+        total_quarters = len(splits)
         processed_count = 0
         for q_name, q_df in splits.items():
             processed_count += 1
-            progress_start = 50 + int((processed_count - 1) / total_quarters * 30) # 50% -> 80%
-            logger.progress(progress_start, f"正在分析 {q_name} ({processed_count}/{total_quarters})...")
-            
+            progress_start = 50 + int(
+                (processed_count - 1) / max(1, total_quarters) * 30
+            )
+            logger.progress(
+                progress_start,
+                f"正在准备 {q_name} ({processed_count}/{total_quarters})..."
+            )
+
             if q_df.empty:
                 logger.info(f"分块 {q_name} 数据为空，跳过")
                 continue
-                
+
+            split_years = q_df[COL_DATETIME].dt.year.dropna()
+            report_year = int(split_years.iloc[0]) if not split_years.empty else None
+            if report_year not in year_contexts:
+                logger.info(f"无法确定 {q_name} 所属年份，跳过")
+                continue
+
             # Sample using Adaptive Strategy (Phase 2 - 3.3)
-            # Use smart_sample from global scope instead of q_analyzer method
             sample_text = smart_sample(q_df, max_tokens, logger)
-            
+
             # Keep each request below the tested provider capacity. A larger
             # selected budget is handled as multiple chronological Map segments.
             segment_budget = min(max_tokens, SAFE_API_SEGMENT_TOKEN_BUDGET)
@@ -408,10 +598,28 @@ def run_analysis_task(task_id, file_path, config):
 
                 map_jobs.append({
                     'order': len(map_jobs),
+                    'report_year': report_year,
                     'name': segment_name,
                     'text': segment_text,
                     'is_segmented': len(segments) > 1,
                 })
+
+        if not map_jobs:
+            raise ValueError("没有可发送的年度聊天分片")
+
+        map_results_by_year = {str(year): [] for year in report_years}
+        intermediate_path = save_intermediate_artifact(
+            task_id,
+            report_years,
+            map_results_by_year,
+            year_contexts,
+            status='map_pending',
+            total_map_jobs=len(map_jobs),
+            completed_map_jobs=0,
+            report_mode=report_mode,
+        )
+        tasks[task_id]['intermediate_path'] = intermediate_path
+        logger.info(f"Map 中间产物已创建: {intermediate_path}")
 
         def run_map_job(job):
             segment_name = job['name']
@@ -427,7 +635,6 @@ def run_analysis_task(task_id, file_path, config):
                 result['_source_segment'] = segment_name
             return job['order'], result
 
-        quarterly_results = [None] * len(map_jobs)
         if map_jobs:
             logger.info(f"开始并行执行 {len(map_jobs)} 个 Map 请求")
             with ThreadPoolExecutor(max_workers=map_concurrency) as executor:
@@ -435,100 +642,184 @@ def run_analysis_task(task_id, file_path, config):
                 completed_jobs = 0
                 for future in as_completed(futures):
                     job_order, result = future.result()
-                    quarterly_results[job_order] = result
+                    job = map_jobs[job_order]
+                    year_key = str(job['report_year'])
+                    map_results_by_year[year_key].append({
+                        'order': job_order,
+                        'period': job['name'],
+                        'analysis': result,
+                    })
                     completed_jobs += 1
                     progress = 50 + int(completed_jobs / len(map_jobs) * 30)
                     logger.progress(
                         progress,
                         f"Map 分析完成 ({completed_jobs}/{len(map_jobs)})..."
                     )
-            
-        # Step 2: Reduce (Annual/Periodic Report)
-        logger.progress(85, "正在生成汇总报告...")
-        
-        # Prepare Global Stats for Reduce
-        global_stats_simple = {
-            'total_messages': stats.get('total_messages'),
-            'total_users': stats.get('total_users'),
-            'year': (
-                str(selected_years[0])
-                if len(selected_years) == 1
-                else '、'.join(map(str, selected_years))
-                if selected_years
-                else analyzer.get_target_year()
-            ),
-            'selected_years': selected_years,
-            'active_users_count': stats.get('active_users_count', 0), # Added safely
-            'silent_users_count': stats.get('silent_users_count', 0), # Added safely
-            'top_talkers': stats.get('top_talkers', []), # Added safely
-            'top_repeaters': stats.get('top_repeaters', []), # Added safely
-            'hardcore': analyzer.get_hardcore_stats()
-        }
-        
-        # 获取小剧场配置
+                    save_intermediate_artifact(
+                        task_id,
+                        report_years,
+                        map_results_by_year,
+                        year_contexts,
+                        status='map_running',
+                        total_map_jobs=len(map_jobs),
+                        completed_map_jobs=completed_jobs,
+                        report_mode=report_mode,
+                    )
+
+        for results in map_results_by_year.values():
+            results.sort(key=lambda item: item['order'])
+        save_intermediate_artifact(
+            task_id,
+            report_years,
+            map_results_by_year,
+            year_contexts,
+            status='map_complete',
+            total_map_jobs=len(map_jobs),
+            completed_map_jobs=len(map_jobs),
+            report_mode=report_mode,
+        )
+
+        # Make Reduce consume the persisted Map artifact, so a later recovery
+        # can use the same downstream path without repeating Map requests.
+        intermediate = load_intermediate_artifact(intermediate_path)
+        map_results_by_year = intermediate['map_results']
+        logger.info(
+            f"已加载 Map 中间产物：{intermediate['completed_map_jobs']}/"
+            f"{intermediate['total_map_jobs']} 个请求"
+        )
+
+        # Step 2-5: Build the requested output set. Independent yearly reports
+        # and the legacy collection report share the same persisted Map output.
         anime_theme = config.get('anime_theme', 'default')
         custom_theme_prompt = config.get('custom_theme_prompt', '')
-        
-        logger.info(f"发送 AI 请求: 汇总报告 (Model: {model_reduce})")
-        final_html = generator.generate_annual_report(
-            quarterly_results, 
-            global_stats_simple,
-            anime_theme=anime_theme,
-            custom_theme_prompt=custom_theme_prompt,
-            model=model_reduce,
-            is_periodic=is_periodic
-        )
-        logger.info("报告生成完成")
-
-        # 4. Render
-        logger.progress(95, "正在渲染 HTML...")
         renderer = ReportRenderer()
-        chat_name = stats.get('title', 'QQ聊天记录')
-        report_filename = f"report_{task_id}.html"
-        report_path = os.path.join(OUTPUT_FOLDER, report_filename)
-        
-        # Get Hardcore Stats
-        rankings = analyzer.get_user_rankings()
-        
-        renderer.render(
-            stats=stats,
-            daily_activity=daily_activity,
-            summary=final_html, 
-            rankings=rankings,
-            output_path=report_path
-        )
-        
-        # 4.1 Enhance HTML (Optional)
-        if config.get('enhance_mode', False):
-            logger.progress(98, "正在进行最终输出增强 (HTML Refine)...")
-            logger.info(f"启动 HTML 修复与 CSS 优化... (Model: {model_refine})")
-            
-            try:
-                with open(report_path, 'r', encoding='utf-8') as f:
-                    raw_html = f.read()
-                
-                refined_html = generator.refine_report_html(raw_html, model=model_refine)
-                
-                if refined_html and len(refined_html) > 100:
-                    with open(report_path, 'w', encoding='utf-8') as f:
-                        f.write(refined_html)
-                    logger.info("HTML 增强完成并已保存")
-                else:
-                    logger.info("HTML 增强结果异常，保留原文件")
-                    
-            except Exception as e:
-                logger.info(f"HTML 增强失败: {e}")
-        
-        # 5. Save History
-        history_manager.add_record(
-            chat_name=chat_name,
-            messages_count=stats['total_messages'],
-            report_path=report_path
-        )
+        result_urls = []
+        def analyses_for_year(report_year):
+            entries = map_results_by_year.get(str(report_year), [])
+            return [
+                entry.get('analysis', entry)
+                if isinstance(entry, dict) else entry
+                for entry in entries
+            ]
 
-        tasks[task_id]['result_url'] = f"/download/{report_filename}"
+        report_specs = []
+        if report_mode in {'per_year', 'both'}:
+            for report_year in report_years:
+                report_specs.append({
+                    'kind': 'year',
+                    'year': int(report_year),
+                    'label': f'{report_year} 年度报告',
+                    'context': year_contexts[report_year],
+                    'map_results': analyses_for_year(report_year),
+                    'reduce_years': [int(report_year)],
+                    'is_periodic': is_periodic and not selected_years,
+                    'filename_suffix': str(report_year),
+                })
+
+        if report_mode in {'combined', 'both'}:
+            combined_results = []
+            for report_year in report_years:
+                combined_results.extend(analyses_for_year(report_year))
+            year_label = '、'.join(map(str, report_years))
+            report_specs.append({
+                'kind': 'combined',
+                'year': None,
+                'label': f'{year_label} 多年集合报告',
+                'context': combined_context,
+                'map_results': combined_results,
+                'reduce_years': report_years,
+                'is_periodic': is_periodic or len(report_years) > 1,
+                'filename_suffix': 'combined',
+            })
+
+        if not report_specs:
+            raise ValueError('没有选择有效的报告生成模式')
+
+        total_reports = len(report_specs)
+        for report_index, report_spec in enumerate(report_specs, start=1):
+            report_label = report_spec['label']
+            context = report_spec['context']
+            report_results = report_spec['map_results']
+            if not report_results:
+                raise ValueError(f"{report_label} 没有可用于汇总的 Map 结果")
+
+            logger.progress(
+                85 + int((report_index - 1) / total_reports * 10),
+                f"正在生成 {report_label} ({report_index}/{total_reports})..."
+            )
+            logger.info(
+                f"发送 AI 请求: {report_label} (Model: {model_reduce})"
+            )
+            final_html = generator.generate_annual_report(
+                report_results,
+                build_reduce_stats(context, report_spec['reduce_years']),
+                anime_theme=anime_theme,
+                custom_theme_prompt=custom_theme_prompt,
+                model=model_reduce,
+                is_periodic=report_spec['is_periodic'],
+            )
+            logger.info(f"{report_label} 汇总完成")
+
+            logger.progress(
+                90 + int(report_index / total_reports * 5),
+                f"正在渲染 {report_label} HTML..."
+            )
+            chat_name = context['stats'].get('chat_name', 'QQ聊天记录')
+            report_filename = f"report_{task_id}_{report_spec['filename_suffix']}.html"
+            report_path = os.path.join(OUTPUT_FOLDER, report_filename)
+            renderer.render(
+                stats=context['stats'],
+                daily_activity=context['daily_activity'],
+                summary=final_html,
+                rankings=context['rankings'],
+                output_path=report_path
+            )
+
+            if config.get('enhance_mode', False):
+                logger.progress(
+                    95 + int(report_index / total_reports * 3),
+                    f"正在增强 {report_label} HTML..."
+                )
+                logger.info(
+                    f"启动 {report_label} HTML 修复与 CSS 优化 "
+                    f"(Model: {model_refine})"
+                )
+                try:
+                    with open(report_path, 'r', encoding='utf-8') as handle:
+                        raw_html = handle.read()
+                    refined_html = generator.refine_report_html(
+                        raw_html,
+                        model=model_refine
+                    )
+                    if refined_html and len(refined_html) > 100:
+                        with open(report_path, 'w', encoding='utf-8') as handle:
+                            handle.write(refined_html)
+                        logger.info(f"{report_label} HTML 增强完成并已保存")
+                    else:
+                        logger.info(f"{report_label} HTML 增强结果异常，保留原文件")
+                except Exception as exc:
+                    logger.info(f"{report_label} HTML 增强失败: {exc}")
+
+            history_manager.add_record(
+                chat_name=chat_name,
+                messages_count=context['stats']['total_messages'],
+                report_path=report_path,
+                year=report_spec['year'],
+                report_mode=report_spec['kind'],
+            )
+            result_urls.append({
+                'year': report_spec['year'],
+                'years': report_spec['reduce_years'],
+                'kind': report_spec['kind'],
+                'label': report_label,
+                'url': f'/download/{report_filename}',
+                'filename': report_filename,
+            })
+
+        tasks[task_id]['result_urls'] = result_urls
+        tasks[task_id]['result_url'] = result_urls[0]['url']
         tasks[task_id]['state'] = 'completed'
-        logger.progress(100, "分析完成！")
+        logger.progress(100, f"{len(result_urls)} 份报告生成完成！")
 
     except Exception as e:
         logger.info(f"Error: {str(e)}")
@@ -549,6 +840,8 @@ def start_analysis_task(file_path, config):
         'status_text': '等待队列...',
         'logs': [],
         'result_url': None,
+        'result_urls': [],
+        'intermediate_path': None,
         'error': None
     }
 
@@ -735,6 +1028,8 @@ def task_status(task_id):
         'status_text': task['status_text'],
         'new_logs': logs_to_send,
         'result_url': task['result_url'],
+        'result_urls': task.get('result_urls', []),
+        'intermediate_path': task.get('intermediate_path'),
         'error': task['error']
     })
 
