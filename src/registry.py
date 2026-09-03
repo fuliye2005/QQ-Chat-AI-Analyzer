@@ -39,6 +39,7 @@ DEFAULT_TOP_N = 10
 DEFAULT_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 UNKNOWN_USER_NAME = "Unknown"
 UNKNOWN_GROUP_NAME = "Unknown Group"
+BUSINESS_TIMEZONE = "Asia/Shanghai"
 
 # --- Phase 3: Prompt Templates ---
 # Map 阶段：季度分析
@@ -97,7 +98,7 @@ PROMPT_MAP_PERIODIC = """
 
 # Reduce 阶段：年度汇总
 PROMPT_REDUCE_ANNUAL = """
-你是一位既幽默又深刻的群聊观察员，擅长通过数据洞察群聊的灵魂，且深谙 ACGN 文化。基于以下4个季度的分析摘要，生成一份年度群聊报告。
+你是一位既幽默又深刻的群聊观察员，擅长通过数据洞察群聊的灵魂，且深谙 ACGN 文化。基于以下完整年度的季度分析摘要，生成一份年度群聊报告。
 
 输入数据：
 {quarterly_data}
@@ -244,6 +245,9 @@ DEFAULT_TEMPERATURE = 0.7
 DEFAULT_LLM_TIMEOUT_SECONDS = 180
 DEFAULT_LLM_MAX_OUTPUT_TOKENS = 8000
 DEFAULT_LLM_MAX_RETRIES = 2
+LLM_TOKEN_PARAMETER_AUTO = "auto"
+LLM_TOKEN_PARAMETER_MAX_TOKENS = "max_tokens"
+LLM_TOKEN_PARAMETER_MAX_COMPLETION_TOKENS = "max_completion_tokens"
 
 # --- Sampling Levels (Phase 2) ---
 LEVEL_1_LOSSLESS = "lossless"

@@ -4,172 +4,247 @@
 QQ Chat Parser Module
 =====================
 负责解析 QQChatExporter 导出的 JSON 文件。
-遵循 Phase 5 编程规范。
 """
 
 import json
+import math
+import numbers
+from typing import Any, Dict, Optional, Tuple
+
 import pandas as pd
-from typing import Dict, Any, Tuple, List, Optional
+
 from src.registry import *
 
+
 class QQChatParser:
-    """
-    负责解析 QQChatExporter 导出的 JSON 文件，转换为结构化的 DataFrame。
-    """
-    
+    """将 QQChatExporter 导出的消息转换为结构化 DataFrame。"""
+
     def __init__(self):
-        # 意义: 初始化解析器
-        # 作用: 目前无特定初始化逻辑，占位
-        # 关联: 无
-        pass
+        self.diagnostics = {
+            "skipped_messages": 0,
+            "unknown_recalled_values": [],
+        }
 
     def parse_json(self, file_content: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-        """
-        解析 JSON 字符串内容。
-        """
-        # 意义: 核心解析方法
-        # 作用: 将 JSON 字符串解析为 Pandas DataFrame 和 元数据字典
-        # 关联: 被主程序调用，依赖 src.registry 定义的常量
-        
+        """解析 JSON 字符串，并返回消息 DataFrame 与文件元数据。"""
         try:
             data = json.loads(file_content)
-        except json.JSONDecodeError:
-            raise ValueError("Invalid JSON format")
+        except json.JSONDecodeError as exc:
+            raise ValueError("Invalid JSON format") from exc
+
+        if not isinstance(data, dict):
+            raise ValueError("JSON 根节点必须是对象")
 
         messages = data.get(JSON_FIELD_MESSAGES, [])
-        parsed_data = []
+        if not isinstance(messages, list):
+            raise ValueError("JSON messages 字段必须是数组")
 
+        parsed_data = []
         for msg in messages:
-            # 意义: 提取单条消息数据
-            # 作用: 遍历消息列表，提取时间、发送者、内容等信息
-            # 关联: 依赖 _parse_single_message 方法
-            
+            if not isinstance(msg, dict):
+                self.diagnostics["skipped_messages"] += 1
+                continue
             parsed_msg = self._parse_single_message(msg)
             if parsed_msg:
                 parsed_data.append(parsed_msg)
+            else:
+                self.diagnostics["skipped_messages"] += 1
 
         df = pd.DataFrame(parsed_data)
-        
-        # 意义: 提取元数据
-        # 作用: 获取群名称、总消息数、时间范围等
-        # 关联: 返回给调用者用于展示
+        chat_info = data.get(JSON_FIELD_CHAT_INFO, {})
+        statistics = data.get(JSON_FIELD_STATISTICS, {})
+        time_range = statistics.get(JSON_FIELD_TIME_RANGE, {})
+        if not isinstance(chat_info, dict):
+            chat_info = {}
+        if not isinstance(statistics, dict):
+            statistics = {}
+        if not isinstance(time_range, dict):
+            time_range = {}
+
         meta = {
-            "chat_name": data.get(JSON_FIELD_CHAT_INFO, {}).get(JSON_FIELD_CHAT_NAME, UNKNOWN_GROUP_NAME),
-            "total_messages": data.get(JSON_FIELD_STATISTICS, {}).get(JSON_FIELD_TOTAL_MESSAGES, 0),
-            "start_time": data.get(JSON_FIELD_STATISTICS, {}).get(JSON_FIELD_TIME_RANGE, {}).get(JSON_FIELD_START),
-            "end_time": data.get(JSON_FIELD_STATISTICS, {}).get(JSON_FIELD_TIME_RANGE, {}).get(JSON_FIELD_END)
+            "chat_name": chat_info.get(JSON_FIELD_CHAT_NAME, UNKNOWN_GROUP_NAME),
+            "total_messages": statistics.get(JSON_FIELD_TOTAL_MESSAGES, 0),
+            "start_time": time_range.get(JSON_FIELD_START),
+            "end_time": time_range.get(JSON_FIELD_END),
+            "diagnostics": {
+                "skipped_messages": self.diagnostics["skipped_messages"],
+                "unknown_recalled_values": list(
+                    self.diagnostics["unknown_recalled_values"]
+                ),
+            },
         }
-        
         return df, meta
 
     def _parse_single_message(self, msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        解析单条消息字典。
-        """
-        # 意义: 单条消息解析逻辑
-        # 作用: 处理时间戳转换、用户ID识别、内容分类等细节
-        # 关联: 被 parse_json 循环调用
-        
-        # 1. 时间处理
-        # 新版导出同时提供 ISO 时间字符串和毫秒时间戳，优先使用带时区的 time。
+        """解析单条消息；无法确定时间时返回 None。"""
         dt = self._parse_message_time(msg)
         if dt is None:
-            # 无法确定时间的消息不能伪造为“当前时间”，否则会污染日期、季度和作息统计。
             return None
 
-        # 2. 发送者识别 (Phase 1 核心: User Identification)
         sender = msg.get(JSON_FIELD_SENDER, {})
-        # 优先使用 uin，其次 uid
-        user_id = sender.get(JSON_FIELD_SENDER_UIN) or sender.get(JSON_FIELD_SENDER_UID, "unknown")
-        # 优先使用 card，其次 name
-        user_name = sender.get(JSON_FIELD_SENDER_CARD) or sender.get(JSON_FIELD_SENDER_NAME, UNKNOWN_USER_NAME)
-
-        # 3. 内容与资源处理 (Phase 1 核心: Content Classification)
-        content_obj = msg.get(JSON_FIELD_CONTENT, {})
-        text_content = content_obj.get(JSON_FIELD_TEXT, "")
-        resources = content_obj.get(JSON_FIELD_RESOURCES, [])
-        
-        msg_type = MSG_TYPE_TEXT
-        image_count = 0
-        
-        if resources:
-            res_types = [r.get("type") for r in resources]
-            image_count = res_types.count("image")
-            
-            if "image" in res_types:
-                msg_type = MSG_TYPE_IMAGE
-            elif "video" in res_types:
-                msg_type = MSG_TYPE_VIDEO
-            elif "file" in res_types:
-                msg_type = MSG_TYPE_FILE
-            
-            if text_content and resources:
-                msg_type = MSG_TYPE_MIXED
-
-        is_recalled = msg.get(
-            JSON_FIELD_IS_RECALLED,
-            msg.get(JSON_FIELD_RECALLED, False)
+        if not isinstance(sender, dict):
+            sender = {}
+        user_id = sender.get(JSON_FIELD_SENDER_UIN) or sender.get(
+            JSON_FIELD_SENDER_UID, "unknown"
+        )
+        user_name = sender.get(JSON_FIELD_SENDER_CARD) or sender.get(
+            JSON_FIELD_SENDER_NAME, UNKNOWN_USER_NAME
         )
 
+        content_obj = msg.get(JSON_FIELD_CONTENT, {})
+        if not isinstance(content_obj, dict):
+            content_obj = {JSON_FIELD_TEXT: str(content_obj)}
+        text_content = content_obj.get(JSON_FIELD_TEXT, "")
+        if text_content is None:
+            text_content = ""
+        resources = content_obj.get(JSON_FIELD_RESOURCES, [])
+        if not isinstance(resources, list):
+            resources = []
+
+        resource_types = [
+            resource.get("type")
+            for resource in resources
+            if isinstance(resource, dict)
+        ]
+        image_count = resource_types.count("image")
+        msg_type = MSG_TYPE_TEXT
+        if "image" in resource_types:
+            msg_type = MSG_TYPE_IMAGE
+        elif "video" in resource_types:
+            msg_type = MSG_TYPE_VIDEO
+        elif "file" in resource_types:
+            msg_type = MSG_TYPE_FILE
+        if text_content and resource_types:
+            msg_type = MSG_TYPE_MIXED
+
+        raw_recalled = msg.get(JSON_FIELD_IS_RECALLED)
+        if raw_recalled is None:
+            raw_recalled = msg.get(JSON_FIELD_RECALLED, False)
+        is_recalled = self._normalize_bool(raw_recalled)
         if is_recalled:
             msg_type = MSG_TYPE_RECALLED
 
-        # 4. 提及处理
-        mentions = [m.get("name") for m in content_obj.get(JSON_FIELD_MENTIONS, [])]
+        raw_mentions = content_obj.get(JSON_FIELD_MENTIONS, [])
+        if not isinstance(raw_mentions, list):
+            raw_mentions = []
+        mentions = [
+            mention.get("name")
+            for mention in raw_mentions
+            if isinstance(mention, dict)
+        ]
 
         return {
             COL_DATETIME: dt,
             COL_DATE: dt.date(),
             COL_TIME: dt.time(),
             COL_HOUR: dt.hour,
-            COL_USER_ID: str(user_id), # 确保 ID 为字符串
+            COL_USER_ID: str(user_id),
             COL_USER_NAME: user_name,
             COL_CONTENT: text_content,
             COL_TYPE: msg_type,
-            COL_IS_RECALLED: bool(is_recalled),
+            COL_IS_RECALLED: is_recalled,
             COL_MENTIONS: mentions,
-            COL_IMAGE_COUNT: image_count
+            COL_IMAGE_COUNT: image_count,
         }
 
     def _parse_message_time(self, msg: Dict[str, Any]) -> Optional[pd.Timestamp]:
-        """解析消息时间，兼容 ISO 字符串以及秒/毫秒/微秒/纳秒时间戳。"""
+        """解析 time，失败后回退 timestamp。"""
         raw_time = msg.get(JSON_FIELD_TIME)
-        if raw_time not in (None, ""):
-            try:
-                parsed = pd.to_datetime(raw_time, utc=True)
-                if not pd.isna(parsed):
-                    return parsed
-            except (TypeError, ValueError, OverflowError):
-                pass
+        if not self._is_missing(raw_time):
+            parsed = self._parse_time_value(raw_time)
+            if parsed is not None:
+                return parsed
 
         raw_timestamp = msg.get(JSON_FIELD_TIMESTAMP)
-        if raw_timestamp in (None, "") or isinstance(raw_timestamp, bool):
+        if self._is_missing(raw_timestamp):
+            return None
+        return self._parse_time_value(raw_timestamp)
+
+    @staticmethod
+    def _is_missing(value: Any) -> bool:
+        """判断标量是否为空；数组等非标量不强行转换为布尔值。"""
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return not value.strip()
+        try:
+            result = pd.isna(value)
+        except (TypeError, ValueError):
+            return False
+        if isinstance(result, bool):
+            return result
+        if type(result).__name__ == "bool_":
+            return bool(result)
+        return False
+
+    @staticmethod
+    def _infer_timestamp_unit(value: float) -> str:
+        """根据 Unix 时间戳数量级推断单位。"""
+        magnitude = abs(value)
+        if magnitude >= 1e17:
+            return "ns"
+        if magnitude >= 1e14:
+            return "us"
+        if magnitude >= 1e11:
+            return "ms"
+        return "s"
+
+    @classmethod
+    def _parse_time_value(cls, value: Any) -> Optional[pd.Timestamp]:
+        """解析字符串或数值时间，并统一到业务时区。"""
+        if cls._is_missing(value) or isinstance(value, bool):
             return None
 
         try:
-            if isinstance(raw_timestamp, (int, float)):
-                numeric_timestamp = raw_timestamp
-            elif isinstance(raw_timestamp, str):
-                timestamp_text = raw_timestamp.strip()
+            numeric_timestamp = None
+            if isinstance(value, numbers.Real):
+                numeric_timestamp = float(value)
+            elif isinstance(value, str):
                 try:
-                    numeric_timestamp = float(timestamp_text)
+                    numeric_timestamp = float(value.strip())
                 except ValueError:
-                    parsed = pd.to_datetime(timestamp_text, utc=True)
-                    return None if pd.isna(parsed) else parsed
-            else:
-                return pd.to_datetime(raw_timestamp, utc=True)
+                    numeric_timestamp = None
 
-            magnitude = abs(float(numeric_timestamp))
-            if magnitude >= 1e17:
-                unit = "ns"
-            elif magnitude >= 1e14:
-                unit = "us"
-            elif magnitude >= 1e11:
-                unit = "ms"
+            if numeric_timestamp is not None:
+                if not math.isfinite(numeric_timestamp):
+                    return None
+                parsed = pd.to_datetime(
+                    numeric_timestamp,
+                    unit=cls._infer_timestamp_unit(numeric_timestamp),
+                    utc=True,
+                )
             else:
-                unit = "s"
+                parsed = pd.to_datetime(value)
 
-            parsed = pd.to_datetime(numeric_timestamp, unit=unit, utc=True)
-            return None if pd.isna(parsed) else parsed
+            if pd.isna(parsed) or not isinstance(parsed, pd.Timestamp):
+                return None
+
+            if parsed.tzinfo is None:
+                parsed = parsed.tz_localize(BUSINESS_TIMEZONE)
+            else:
+                parsed = parsed.tz_convert(BUSINESS_TIMEZONE)
+            return parsed
         except (TypeError, ValueError, OverflowError):
             return None
+
+    def _normalize_bool(self, value: Any) -> bool:
+        """显式规范化导出文件中的撤回布尔值。"""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, numbers.Real) and not isinstance(value, bool):
+            if value == 1:
+                return True
+            if value == 0:
+                return False
+
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "y", "是", "真"}:
+                return True
+            if normalized in {"false", "0", "no", "n", "否", "假", ""}:
+                return False
+            if normalized not in self.diagnostics["unknown_recalled_values"]:
+                self.diagnostics["unknown_recalled_values"].append(normalized)
+            return False
+
+        return False

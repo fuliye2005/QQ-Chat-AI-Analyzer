@@ -20,7 +20,13 @@ class PromptManager:
         # 作用: 占位，未来可加载外部模板文件
         pass
 
-    def build_map_prompt(self, quarter_name: str, chat_content: str, is_periodic: bool = False) -> str:
+    def build_map_prompt(
+        self,
+        quarter_name: str,
+        chat_content: str,
+        is_periodic: bool = False,
+        coverage: dict = None,
+    ) -> str:
         """
         构建 Map 阶段 (季度/阶段分析) 的 Prompt。
         """
@@ -29,9 +35,23 @@ class PromptManager:
         # 关联: 被 Generator 调用，用于获取中间态 JSON
         
         template = PROMPT_MAP_PERIODIC if is_periodic else PROMPT_MAP_QUARTERLY
-        return template.format(quarter=quarter_name) + "\n\n聊天记录片段:\n" + chat_content
+        prompt = template.format(quarter=quarter_name)
+        if coverage:
+            prompt += "\n\n" + self._format_coverage_instruction(
+                coverage,
+                report_scope=coverage.get("report_scope"),
+            )
+        return prompt + "\n\n聊天记录片段:\n" + chat_content
 
-    def build_reduce_prompt(self, quarterly_results: list, global_stats: dict, anime_theme: str = "default", custom_theme_prompt: str = "", is_periodic: bool = False) -> str:
+    def build_reduce_prompt(
+        self,
+        quarterly_results: list,
+        global_stats: dict,
+        anime_theme: str = "default",
+        custom_theme_prompt: str = "",
+        is_periodic: bool = False,
+        report_scope: str = None,
+    ) -> str:
         """
         构建 Reduce 阶段 (年度/阶段汇总) 的 Prompt。
         
@@ -60,18 +80,80 @@ class PromptManager:
         - 熬夜冠军 (Top 3): {hardcore.get('night_owls', [])}
         - 早起冠军 (Top 3): {hardcore.get('early_birds', [])}
         - 最长连续发言: {hardcore.get('longest_streak', {})}
+        - Map 数据是否完整: {global_stats.get('map_data_complete', True)}
+        - Map 失败任务: {global_stats.get('map_failures', [])}
         """
         
-        template = PROMPT_REDUCE_PERIODIC if is_periodic else PROMPT_REDUCE_ANNUAL
+        resolved_scope = report_scope or global_stats.get("report_scope")
+        selected_years = global_stats.get("selected_years") or []
+        is_multi_year_combined = (
+            resolved_scope == "combined" and len(selected_years) > 1
+        )
+        template = (
+            PROMPT_REDUCE_PERIODIC
+            if is_periodic
+            or resolved_scope == "periodic"
+            or is_multi_year_combined
+            else PROMPT_REDUCE_ANNUAL
+        )
         
         # 处理小剧场主题指令
         anime_instruction = self._get_anime_instruction(anime_theme, custom_theme_prompt)
         
-        return template.format(
+        prompt = template.format(
             quarterly_data=q_data_str,
             stats_data=stats_str,
             year=global_stats.get('year', 'Unknown'),
             anime_instruction=anime_instruction
+        )
+        coverage = global_stats.get("coverage")
+        if coverage:
+            prompt += "\n\n" + self._format_coverage_instruction(
+                coverage,
+                report_scope=resolved_scope,
+            )
+        if resolved_scope == "combined":
+            prompt += (
+                "\n这是集合报告通道。请保留各选中年份的边界和差异，"
+                "不要把不同年份的消息误写成同一年度事件。"
+            )
+        return prompt
+
+    @staticmethod
+    def _format_coverage_instruction(coverage: dict, report_scope: str = None) -> str:
+        """Make the observed time range explicit to prevent invented quarters."""
+        if report_scope == "combined" or coverage.get("coverage_by_year"):
+            entries = coverage.get("coverage_by_year", {})
+            scope_label = "多年/集合分析" if len(entries) > 1 else "单年集合分析"
+            lines = [
+                f"数据覆盖约束：这是一个{scope_label}，以下是各年份实际覆盖范围："
+            ]
+            for year, item in sorted(entries.items(), key=lambda pair: str(pair[0])):
+                lines.append(PromptManager._format_single_coverage(year, item))
+            lines.append("只描述上述实际覆盖月份和时间段，不要补写缺失月份或不存在的季度。")
+            return "\n".join(lines)
+
+        year = coverage.get("year", "Unknown")
+        lines = ["数据覆盖约束：", PromptManager._format_single_coverage(year, coverage)]
+        if coverage.get("is_full_year"):
+            lines.append("这是完整自然年数据，可以按全年四个季度进行分析。")
+        else:
+            lines.append(
+                "这是不完整年度/阶段数据。只能分析实际覆盖期间，"
+                "不得虚构未覆盖月份、季度或事件。"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_single_coverage(year, coverage: dict) -> str:
+        covered_months = coverage.get("covered_months", [])
+        covered_quarters = coverage.get("covered_quarters", [])
+        missing_months = coverage.get("missing_months", [])
+        return (
+            f"- {year} 年：{coverage.get('start_time', '未知')} 至 "
+            f"{coverage.get('end_time', '未知')}；覆盖月份={covered_months}；"
+            f"覆盖季度={covered_quarters}；缺失月份={missing_months}；"
+            f"完整年度={bool(coverage.get('is_full_year'))}"
         )
 
     def _get_anime_instruction(self, theme: str, custom_prompt: str) -> str:

@@ -5,6 +5,7 @@ import threading
 import uuid
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import pandas as pd
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 from src.parser import QQChatParser
@@ -93,6 +94,43 @@ def normalize_report_mode(value):
     return mode if mode in VALID_REPORT_MODES else 'per_year'
 
 
+def build_year_coverage(df, year=None):
+    """Describe the actual calendar coverage represented by a DataFrame."""
+    if df is None or df.empty:
+        return {
+            'year': int(year) if year is not None else None,
+            'start_time': None,
+            'end_time': None,
+            'covered_months': [],
+            'covered_quarters': [],
+            'missing_months': list(range(1, 13)),
+            'is_full_year': False,
+            'report_scope': 'periodic',
+        }
+
+    working = df
+    if year is not None:
+        working = df[df[COL_DATETIME].dt.year == int(year)]
+    if working.empty:
+        return build_year_coverage(pd.DataFrame(), year)
+
+    timestamps = working[COL_DATETIME].dropna()
+    covered_months = sorted({int(month) for month in timestamps.dt.month})
+    covered_quarters = sorted({int(quarter) for quarter in timestamps.dt.quarter})
+    missing_months = [month for month in range(1, 13) if month not in covered_months]
+    is_full_year = covered_months == list(range(1, 13))
+    return {
+        'year': int(year) if year is not None else int(timestamps.dt.year.mode().iloc[0]),
+        'start_time': timestamps.min().isoformat(),
+        'end_time': timestamps.max().isoformat(),
+        'covered_months': covered_months,
+        'covered_quarters': covered_quarters,
+        'missing_months': missing_months,
+        'is_full_year': is_full_year,
+        'report_scope': 'annual' if is_full_year else 'periodic',
+    }
+
+
 def get_year_summary(df):
     """Return JSON-serializable year ranges and message counts."""
     if df.empty:
@@ -103,11 +141,16 @@ def get_year_summary(df):
     summary = []
     for year in years:
         year_df = df[year_series == year]
+        coverage = build_year_coverage(year_df, year)
         summary.append({
             'year': year,
             'message_count': int(len(year_df)),
-            'start_time': year_df[COL_DATETIME].min().isoformat(),
-            'end_time': year_df[COL_DATETIME].max().isoformat(),
+            'start_time': coverage['start_time'],
+            'end_time': coverage['end_time'],
+            'covered_months': coverage['covered_months'],
+            'covered_quarters': coverage['covered_quarters'],
+            'missing_months': coverage['missing_months'],
+            'is_full_year': coverage['is_full_year'],
         })
     return summary
 
@@ -160,6 +203,9 @@ def build_year_context(df, meta, year):
     stats['selected_years'] = [year]
     stats['start_time'] = year_df[COL_DATETIME].min().isoformat()
     stats['end_time'] = year_df[COL_DATETIME].max().isoformat()
+    coverage = build_year_coverage(year_df, year)
+    stats['coverage'] = coverage
+    stats['report_scope'] = coverage['report_scope']
 
     return {
         'year': year,
@@ -169,6 +215,7 @@ def build_year_context(df, meta, year):
         'daily_activity': analyzer.get_daily_activity(),
         'rankings': analyzer.get_user_rankings(),
         'hardcore': analyzer.get_hardcore_stats(),
+        'coverage': coverage,
     }
 
 
@@ -184,6 +231,20 @@ def build_combined_context(df, meta, years):
     stats['selected_years'] = [int(year) for year in years]
     stats['start_time'] = df[COL_DATETIME].min().isoformat()
     stats['end_time'] = df[COL_DATETIME].max().isoformat()
+    coverage_by_year = {
+        str(year): build_year_coverage(df, year)
+        for year in years
+    }
+    coverage = {
+        'report_scope': 'combined',
+        'years': [int(year) for year in years],
+        'coverage_by_year': coverage_by_year,
+        'is_full_year': all(
+            item['is_full_year'] for item in coverage_by_year.values()
+        ),
+    }
+    stats['coverage'] = coverage
+    stats['report_scope'] = 'combined'
 
     return {
         'years': [int(year) for year in years],
@@ -193,6 +254,7 @@ def build_combined_context(df, meta, years):
         'daily_activity': analyzer.get_daily_activity(),
         'rankings': analyzer.get_user_rankings(),
         'hardcore': analyzer.get_hardcore_stats(),
+        'coverage': coverage,
     }
 
 
@@ -208,6 +270,17 @@ def serialize_year_context(context):
             for name, frame in context['rankings'].items()
         },
         'hardcore': make_json_safe(context['hardcore']),
+        'coverage': make_json_safe(context.get('coverage', {})),
+    }
+
+
+def serialize_map_job(job):
+    """Keep only JSON-safe identifying fields in an intermediate artifact."""
+    return {
+        'order': int(job.get('order', -1)),
+        'report_year': job.get('report_year'),
+        'name': job.get('name', ''),
+        'is_segmented': bool(job.get('is_segmented', False)),
     }
 
 
@@ -220,19 +293,35 @@ def save_intermediate_artifact(
     total_map_jobs,
     completed_map_jobs,
     report_mode='per_year',
+    failures=None,
+    pending_jobs=None,
+    successful_map_jobs=None,
 ):
-    """Atomically save Map output so Reduce can be retried after a failure."""
+    """Atomically save Map diagnostics for the current task."""
     os.makedirs(INTERMEDIATE_FOLDER, exist_ok=True)
     artifact_path = os.path.join(INTERMEDIATE_FOLDER, f'{task_id}.json')
+    failures = list(failures or [])
+    pending_jobs = [serialize_map_job(job) for job in (pending_jobs or [])]
+    successful_map_jobs = (
+        int(successful_map_jobs)
+        if successful_map_jobs is not None
+        else max(0, int(completed_map_jobs) - len(failures))
+    )
     artifact = {
-        'version': 1,
+        'version': 2,
         'task_id': task_id,
         'status': status,
         'report_mode': normalize_report_mode(report_mode),
         'report_years': [int(year) for year in report_years],
         'completed_map_jobs': int(completed_map_jobs),
+        'successful_map_jobs': successful_map_jobs,
+        'failed_map_job_count': len(failures),
         'total_map_jobs': int(total_map_jobs),
         'map_results': make_json_safe(map_results_by_year),
+        'failures': make_json_safe(failures),
+        'pending_jobs': make_json_safe(pending_jobs),
+        'pending_map_jobs': make_json_safe(pending_jobs),
+        'failed_map_jobs': make_json_safe(failures),
         'year_contexts': {
             str(year): serialize_year_context(context)
             for year, context in year_contexts.items()
@@ -246,17 +335,21 @@ def save_intermediate_artifact(
 
 
 def load_intermediate_artifact(artifact_path):
-    """Read and validate a persisted Map artifact before Reduce."""
+    """Read and validate a persisted Map diagnostic artifact before Reduce."""
     with open(artifact_path, 'r', encoding='utf-8') as handle:
         artifact = json.load(handle)
-    if artifact.get('version') != 1:
+    if artifact.get('version') not in {1, 2}:
         raise ValueError('不支持的中间产物版本')
     if not isinstance(artifact.get('map_results'), dict):
         raise ValueError('中间产物缺少 Map 结果')
+    artifact.setdefault('failures', [])
+    artifact.setdefault('pending_jobs', [])
+    artifact.setdefault('pending_map_jobs', artifact['pending_jobs'])
+    artifact.setdefault('failed_map_jobs', artifact['failures'])
     return artifact
 
 
-def build_reduce_stats(context, years):
+def build_reduce_stats(context, years, map_failures=None):
     """Build Reduce input from one year or a selected year collection."""
     if isinstance(years, (list, tuple, set)):
         selected_years = [int(year) for year in years]
@@ -277,6 +370,10 @@ def build_reduce_stats(context, years):
         'top_talkers': hardcore.get('top_talkers', []),
         'top_repeaters': stats.get('top_repeaters', []),
         'hardcore': hardcore,
+        'coverage': context.get('coverage', {}),
+        'report_scope': context.get('stats', {}).get('report_scope'),
+        'map_failures': make_json_safe(map_failures or []),
+        'map_data_complete': not bool(map_failures),
     }
 
 class TaskLogger:
@@ -409,6 +506,8 @@ def split_text_by_token_budget(text, max_tokens):
 # --- Analysis Worker ---
 def run_analysis_task(task_id, file_path, config):
     logger = TaskLogger(task_id)
+    result_urls = []
+    failed_reports = []
     try:
         tasks[task_id]['state'] = 'processing'
         logger.progress(5, "正在初始化组件...")
@@ -454,6 +553,12 @@ def run_analysis_task(task_id, file_path, config):
         logger.progress(30, "正在进行统计分析...")
         analyzer = ChatAnalyzer(df)
         report_years = selected_years or [int(analyzer.get_target_year())]
+        if not selected_years:
+            # The legacy upload path analyzes the dominant year only. Filter before
+            # splitting so dynamic sampling cannot mix neighboring calendar years.
+            target_year = report_years[0]
+            df = df[df[COL_DATETIME].dt.year == target_year].copy()
+            analyzer = ChatAnalyzer(df)
         year_contexts = {}
         for report_year in report_years:
             context = build_year_context(df, meta, report_year)
@@ -493,6 +598,7 @@ def run_analysis_task(task_id, file_path, config):
             'timeout': request_timeout,
             'max_output_tokens': request_output_tokens,
             'max_retries': request_retries,
+            'token_parameter': config.get('token_parameter', 'auto'),
             'logger': logger.info,
         }
         if llm_mode == LLM_MODE_CUSTOM:
@@ -539,15 +645,6 @@ def run_analysis_task(task_id, file_path, config):
         logger.info("正在进行切分...")
         splits = analyzer.get_quarterly_splits(selected_years or None)
 
-        # Keep the old periodic Map prompt for the collection-report channel.
-        # Independent yearly reports always use the quarterly prompt.
-        is_periodic = report_mode == 'combined' and len(report_years) > 1
-        if not selected_years and splits and any(
-            key.startswith("Period_") for key in splits.keys()
-        ):
-            is_periodic = True
-            logger.info("检测到非完整年度数据，启用阶段性分析模式")
-
         if not splits:
             logger.info("切分失败，按年度降级为全量分析")
             splits = {
@@ -578,6 +675,8 @@ def run_analysis_task(task_id, file_path, config):
                 logger.info(f"无法确定 {q_name} 所属年份，跳过")
                 continue
 
+            coverage = year_contexts[report_year].get('coverage', {})
+
             # Sample using Adaptive Strategy (Phase 2 - 3.3)
             sample_text = smart_sample(q_df, max_tokens, logger)
 
@@ -602,6 +701,8 @@ def run_analysis_task(task_id, file_path, config):
                     'name': segment_name,
                     'text': segment_text,
                     'is_segmented': len(segments) > 1,
+                    'coverage': coverage,
+                    'is_periodic': not coverage.get('is_full_year', False),
                 })
 
         if not map_jobs:
@@ -613,10 +714,11 @@ def run_analysis_task(task_id, file_path, config):
             report_years,
             map_results_by_year,
             year_contexts,
-            status='map_pending',
+            status='map_running',
             total_map_jobs=len(map_jobs),
             completed_map_jobs=0,
             report_mode=report_mode,
+            pending_jobs=map_jobs,
         )
         tasks[task_id]['intermediate_path'] = intermediate_path
         logger.info(f"Map 中间产物已创建: {intermediate_path}")
@@ -628,7 +730,8 @@ def run_analysis_task(task_id, file_path, config):
                 segment_name,
                 job['text'],
                 model=model_map,
-                is_periodic=is_periodic,
+                is_periodic=job['is_periodic'],
+                coverage=job['coverage'],
             )
             if job['is_segmented'] and isinstance(result, dict):
                 result = dict(result)
@@ -638,18 +741,55 @@ def run_analysis_task(task_id, file_path, config):
         if map_jobs:
             logger.info(f"开始并行执行 {len(map_jobs)} 个 Map 请求")
             with ThreadPoolExecutor(max_workers=map_concurrency) as executor:
-                futures = [executor.submit(run_map_job, job) for job in map_jobs]
+                future_to_job = {
+                    executor.submit(run_map_job, job): job
+                    for job in map_jobs
+                }
+                pending_orders = {job['order'] for job in map_jobs}
+                failures = []
+                successful_jobs = 0
                 completed_jobs = 0
-                for future in as_completed(futures):
-                    job_order, result = future.result()
-                    job = map_jobs[job_order]
-                    year_key = str(job['report_year'])
-                    map_results_by_year[year_key].append({
-                        'order': job_order,
-                        'period': job['name'],
-                        'analysis': result,
-                    })
-                    completed_jobs += 1
+                for future in as_completed(future_to_job):
+                    job = future_to_job[future]
+                    try:
+                        job_order, result = future.result()
+                        year_key = str(job['report_year'])
+                        map_results_by_year[year_key].append({
+                            'order': job_order,
+                            'period': job['name'],
+                            'analysis': result,
+                        })
+                        successful_jobs += 1
+                        logger.info(f"Map 完成: {job['name']}")
+                    except Exception as exc:
+                        failure = {
+                            'order': job['order'],
+                            'report_year': job['report_year'],
+                            'name': job['name'],
+                            'error_type': type(exc).__name__,
+                            'error': str(exc),
+                            'attempts': request_retries,
+                        }
+                        failures.append(failure)
+                        logger.info(
+                            f"Map 失败但继续收集其他结果: {job['name']} | "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    finally:
+                        pending_orders.discard(job['order'])
+                        completed_jobs += 1
+                    pending_jobs = [
+                        item for item in map_jobs
+                        if item['order'] in pending_orders
+                    ]
+                    if pending_jobs:
+                        map_status = 'map_partial' if failures else 'map_running'
+                    elif successful_jobs == 0:
+                        map_status = 'map_failed'
+                    elif failures:
+                        map_status = 'map_partial'
+                    else:
+                        map_status = 'map_complete'
                     progress = 50 + int(completed_jobs / len(map_jobs) * 30)
                     logger.progress(
                         progress,
@@ -660,29 +800,46 @@ def run_analysis_task(task_id, file_path, config):
                         report_years,
                         map_results_by_year,
                         year_contexts,
-                        status='map_running',
+                        status=map_status,
                         total_map_jobs=len(map_jobs),
                         completed_map_jobs=completed_jobs,
                         report_mode=report_mode,
+                        failures=failures,
+                        pending_jobs=pending_jobs,
+                        successful_map_jobs=successful_jobs,
                     )
 
         for results in map_results_by_year.values():
             results.sort(key=lambda item: item['order'])
+        if 'failures' not in locals():
+            failures = []
+        if 'successful_jobs' not in locals():
+            successful_jobs = 0
+        final_map_status = (
+            'map_failed'
+            if successful_jobs == 0
+            else 'map_partial'
+            if failures
+            else 'map_complete'
+        )
         save_intermediate_artifact(
             task_id,
             report_years,
             map_results_by_year,
             year_contexts,
-            status='map_complete',
+            status=final_map_status,
             total_map_jobs=len(map_jobs),
             completed_map_jobs=len(map_jobs),
             report_mode=report_mode,
+            failures=failures,
+            pending_jobs=[],
+            successful_map_jobs=successful_jobs,
         )
 
-        # Make Reduce consume the persisted Map artifact, so a later recovery
-        # can use the same downstream path without repeating Map requests.
+        # Make Reduce consume the persisted diagnostic artifact from this task.
         intermediate = load_intermediate_artifact(intermediate_path)
         map_results_by_year = intermediate['map_results']
+        map_failures = intermediate.get('failures', [])
         logger.info(
             f"已加载 Map 中间产物：{intermediate['completed_map_jobs']}/"
             f"{intermediate['total_map_jobs']} 个请求"
@@ -693,7 +850,6 @@ def run_analysis_task(task_id, file_path, config):
         anime_theme = config.get('anime_theme', 'default')
         custom_theme_prompt = config.get('custom_theme_prompt', '')
         renderer = ReportRenderer()
-        result_urls = []
         def analyses_for_year(report_year):
             entries = map_results_by_year.get(str(report_year), [])
             return [
@@ -705,14 +861,19 @@ def run_analysis_task(task_id, file_path, config):
         report_specs = []
         if report_mode in {'per_year', 'both'}:
             for report_year in report_years:
+                year_context = year_contexts[report_year]
+                is_year_periodic = not year_context.get('coverage', {}).get(
+                    'is_full_year', False
+                )
                 report_specs.append({
                     'kind': 'year',
                     'year': int(report_year),
                     'label': f'{report_year} 年度报告',
-                    'context': year_contexts[report_year],
+                    'context': year_context,
                     'map_results': analyses_for_year(report_year),
                     'reduce_years': [int(report_year)],
-                    'is_periodic': is_periodic and not selected_years,
+                    'is_periodic': is_year_periodic,
+                    'report_scope': 'periodic' if is_year_periodic else 'annual',
                     'filename_suffix': str(report_year),
                 })
 
@@ -721,14 +882,25 @@ def run_analysis_task(task_id, file_path, config):
             for report_year in report_years:
                 combined_results.extend(analyses_for_year(report_year))
             year_label = '、'.join(map(str, report_years))
+            collection_label = (
+                f'{year_label} 多年集合报告'
+                if len(report_years) > 1
+                else f'{year_label} 集合报告'
+            )
             report_specs.append({
                 'kind': 'combined',
                 'year': None,
-                'label': f'{year_label} 多年集合报告',
+                'label': collection_label,
                 'context': combined_context,
                 'map_results': combined_results,
                 'reduce_years': report_years,
-                'is_periodic': is_periodic or len(report_years) > 1,
+                'is_periodic': (
+                    len(report_years) > 1
+                    or not combined_context.get('coverage', {}).get(
+                        'is_full_year', False
+                    )
+                ),
+                'report_scope': 'combined',
                 'filename_suffix': 'combined',
             })
 
@@ -736,95 +908,178 @@ def run_analysis_task(task_id, file_path, config):
             raise ValueError('没有选择有效的报告生成模式')
 
         total_reports = len(report_specs)
+
+        def failures_for_spec(report_spec):
+            if report_spec['kind'] == 'combined':
+                return list(map_failures)
+            return [
+                failure for failure in map_failures
+                if int(failure.get('report_year', -1)) == int(report_spec['year'])
+            ]
+
         for report_index, report_spec in enumerate(report_specs, start=1):
             report_label = report_spec['label']
             context = report_spec['context']
             report_results = report_spec['map_results']
+            report_failures = failures_for_spec(report_spec)
             if not report_results:
-                raise ValueError(f"{report_label} 没有可用于汇总的 Map 结果")
+                failure = {
+                    'phase': 'reduce',
+                    'kind': report_spec['kind'],
+                    'year': report_spec['year'],
+                    'label': report_label,
+                    'error_type': 'NoMapResults',
+                    'error': f"{report_label} 没有可用于汇总的 Map 结果",
+                }
+                failed_reports.append(failure)
+                logger.info(failure['error'])
+                continue
 
             logger.progress(
                 85 + int((report_index - 1) / total_reports * 10),
                 f"正在生成 {report_label} ({report_index}/{total_reports})..."
             )
-            logger.info(
-                f"发送 AI 请求: {report_label} (Model: {model_reduce})"
-            )
-            final_html = generator.generate_annual_report(
-                report_results,
-                build_reduce_stats(context, report_spec['reduce_years']),
-                anime_theme=anime_theme,
-                custom_theme_prompt=custom_theme_prompt,
-                model=model_reduce,
-                is_periodic=report_spec['is_periodic'],
-            )
-            logger.info(f"{report_label} 汇总完成")
-
-            logger.progress(
-                90 + int(report_index / total_reports * 5),
-                f"正在渲染 {report_label} HTML..."
-            )
-            chat_name = context['stats'].get('chat_name', 'QQ聊天记录')
-            report_filename = f"report_{task_id}_{report_spec['filename_suffix']}.html"
-            report_path = os.path.join(OUTPUT_FOLDER, report_filename)
-            renderer.render(
-                stats=context['stats'],
-                daily_activity=context['daily_activity'],
-                summary=final_html,
-                rankings=context['rankings'],
-                output_path=report_path
-            )
-
-            if config.get('enhance_mode', False):
-                logger.progress(
-                    95 + int(report_index / total_reports * 3),
-                    f"正在增强 {report_label} HTML..."
-                )
+            try:
                 logger.info(
-                    f"启动 {report_label} HTML 修复与 CSS 优化 "
-                    f"(Model: {model_refine})"
+                    f"发送 AI 请求: {report_label} (Model: {model_reduce})"
                 )
-                try:
-                    with open(report_path, 'r', encoding='utf-8') as handle:
-                        raw_html = handle.read()
-                    refined_html = generator.refine_report_html(
-                        raw_html,
-                        model=model_refine
+                reduce_stats = build_reduce_stats(
+                    context,
+                    report_spec['reduce_years'],
+                    map_failures=report_failures,
+                )
+                final_html = generator.generate_annual_report(
+                    report_results,
+                    reduce_stats,
+                    anime_theme=anime_theme,
+                    custom_theme_prompt=custom_theme_prompt,
+                    model=model_reduce,
+                    is_periodic=report_spec['is_periodic'],
+                    report_scope=report_spec['report_scope'],
+                )
+                logger.info(f"{report_label} 汇总完成")
+
+                logger.progress(
+                    90 + int(report_index / total_reports * 5),
+                    f"正在渲染 {report_label} HTML..."
+                )
+                chat_name = context['stats'].get('chat_name', 'QQ聊天记录')
+                report_filename = f"report_{task_id}_{report_spec['filename_suffix']}.html"
+                report_path = os.path.join(OUTPUT_FOLDER, report_filename)
+                renderer.render(
+                    stats=context['stats'],
+                    daily_activity=context['daily_activity'],
+                    summary=final_html,
+                    rankings=context['rankings'],
+                    output_path=report_path
+                )
+
+                if config.get('enhance_mode', False):
+                    logger.progress(
+                        95 + int(report_index / total_reports * 3),
+                        f"正在增强 {report_label} HTML..."
                     )
-                    if refined_html and len(refined_html) > 100:
-                        with open(report_path, 'w', encoding='utf-8') as handle:
-                            handle.write(refined_html)
-                        logger.info(f"{report_label} HTML 增强完成并已保存")
-                    else:
-                        logger.info(f"{report_label} HTML 增强结果异常，保留原文件")
-                except Exception as exc:
-                    logger.info(f"{report_label} HTML 增强失败: {exc}")
+                    logger.info(
+                        f"启动 {report_label} HTML 修复与 CSS 优化 "
+                        f"(Model: {model_refine})"
+                    )
+                    try:
+                        with open(report_path, 'r', encoding='utf-8') as handle:
+                            raw_html = handle.read()
+                        refined_html = generator.refine_report_html(
+                            raw_html,
+                            model=model_refine
+                        )
+                        if refined_html and len(refined_html) > 100:
+                            with open(report_path, 'w', encoding='utf-8') as handle:
+                                handle.write(refined_html)
+                            logger.info(f"{report_label} HTML 增强完成并已保存")
+                        else:
+                            logger.info(f"{report_label} HTML 增强结果异常，保留原文件")
+                    except Exception as exc:
+                        logger.info(f"{report_label} HTML 增强失败: {exc}")
 
-            history_manager.add_record(
-                chat_name=chat_name,
-                messages_count=context['stats']['total_messages'],
-                report_path=report_path,
-                year=report_spec['year'],
-                report_mode=report_spec['kind'],
-            )
-            result_urls.append({
-                'year': report_spec['year'],
-                'years': report_spec['reduce_years'],
-                'kind': report_spec['kind'],
-                'label': report_label,
-                'url': f'/download/{report_filename}',
-                'filename': report_filename,
-            })
+                history_manager.add_record(
+                    chat_name=chat_name,
+                    messages_count=context['stats']['total_messages'],
+                    report_path=report_path,
+                    year=report_spec['year'],
+                    report_mode=report_spec['kind'],
+                )
+                result_urls.append({
+                    'year': report_spec['year'],
+                    'years': report_spec['reduce_years'],
+                    'kind': report_spec['kind'],
+                    'label': report_label,
+                    'url': f'/download/{report_filename}',
+                    'filename': report_filename,
+                })
+                tasks[task_id]['result_urls'] = list(result_urls)
+                tasks[task_id]['result_url'] = result_urls[0]['url']
+            except Exception as exc:
+                failure = {
+                    'phase': 'reduce',
+                    'kind': report_spec['kind'],
+                    'year': report_spec['year'],
+                    'label': report_label,
+                    'error_type': type(exc).__name__,
+                    'error': str(exc),
+                }
+                failed_reports.append(failure)
+                logger.info(
+                    f"{report_label} 失败但继续处理其他报告: "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
+        all_failures = list(map_failures) + list(failed_reports)
         tasks[task_id]['result_urls'] = result_urls
-        tasks[task_id]['result_url'] = result_urls[0]['url']
-        tasks[task_id]['state'] = 'completed'
-        logger.progress(100, f"{len(result_urls)} 份报告生成完成！")
+        tasks[task_id]['result_url'] = result_urls[0]['url'] if result_urls else None
+        tasks[task_id]['failed_reports'] = failed_reports
+        tasks[task_id]['failures'] = all_failures
+        if result_urls and not all_failures:
+            tasks[task_id]['state'] = 'completed'
+            tasks[task_id]['error'] = None
+            logger.progress(100, f"{len(result_urls)} 份报告生成完成！")
+        elif result_urls:
+            tasks[task_id]['state'] = 'partial'
+            tasks[task_id]['error'] = None
+            logger.progress(
+                100,
+                f"已生成 {len(result_urls)} 份报告，另有 {len(all_failures)} 项失败"
+            )
+        else:
+            tasks[task_id]['state'] = 'failed'
+            tasks[task_id]['error'] = (
+                f"没有报告生成成功；失败项 {len(all_failures)} 个"
+            )
+            logger.progress(100, tasks[task_id]['error'])
 
     except Exception as e:
         logger.info(f"Error: {str(e)}")
-        tasks[task_id]['state'] = 'failed'
-        tasks[task_id]['error'] = str(e)
+        outer_failure = {
+            'phase': 'task',
+            'error_type': type(e).__name__,
+            'error': str(e),
+        }
+        if result_urls:
+            tasks[task_id]['state'] = 'partial'
+            tasks[task_id]['result_urls'] = list(result_urls)
+            tasks[task_id]['result_url'] = result_urls[0]['url']
+            tasks[task_id]['failed_reports'] = list(failed_reports)
+            tasks[task_id]['failures'] = (
+                list(tasks[task_id].get('failures', []))
+                + list(failed_reports)
+                + [outer_failure]
+            )
+            tasks[task_id]['error'] = None
+        else:
+            tasks[task_id]['state'] = 'failed'
+            tasks[task_id]['error'] = str(e)
+            tasks[task_id]['failures'] = (
+                list(tasks[task_id].get('failures', []))
+                + list(failed_reports)
+                + [outer_failure]
+            )
     finally:
         # Clean up uploaded file
         if os.path.exists(file_path):
@@ -841,6 +1096,9 @@ def start_analysis_task(file_path, config):
         'logs': [],
         'result_url': None,
         'result_urls': [],
+        'failed_reports': [],
+        'failures': [],
+        'report_mode': normalize_report_mode(config.get('report_mode')),
         'intermediate_path': None,
         'error': None
     }
@@ -1029,6 +1287,9 @@ def task_status(task_id):
         'new_logs': logs_to_send,
         'result_url': task['result_url'],
         'result_urls': task.get('result_urls', []),
+        'failed_reports': task.get('failed_reports', []),
+        'failures': task.get('failures', []),
+        'report_mode': task.get('report_mode'),
         'intermediate_path': task.get('intermediate_path'),
         'error': task['error']
     })

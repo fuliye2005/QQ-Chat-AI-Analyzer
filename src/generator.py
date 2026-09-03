@@ -13,6 +13,7 @@ import time
 from src.registry import *
 from src.llm_client import LLMClient
 from src.prompts import PromptManager
+from src.schema import validate_map_result, validate_reduce_result
 
 class ReportGenerator:
     """
@@ -32,7 +33,14 @@ class ReportGenerator:
         if self.logger:
             self.logger(message)
 
-    def generate_quarterly_analysis(self, quarter: str, content: str, model: str = None, is_periodic: bool = False) -> Dict[str, Any]:
+    def generate_quarterly_analysis(
+        self,
+        quarter: str,
+        content: str,
+        model: str = None,
+        is_periodic: bool = False,
+        coverage: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         执行 Map 阶段：生成单季度/阶段隐性分析。
         """
@@ -40,7 +48,12 @@ class ReportGenerator:
         # 作用: 调用 LLM 分析单季度数据
         # 关联: 输出 JSON 中间态
         
-        prompt = self.prompts.build_map_prompt(quarter, content, is_periodic=is_periodic)
+        prompt = self.prompts.build_map_prompt(
+            quarter,
+            content,
+            is_periodic=is_periodic,
+            coverage=coverage,
+        )
         system_prompt = "你是一个 JSON 生成器。请仅返回合法的 JSON 数据，不要包含 markdown 代码块标记。"
         
         try:
@@ -60,15 +73,24 @@ class ReportGenerator:
             if clean_response.endswith("```"):
                 clean_response = clean_response[:-3]
                 
-            result = json.loads(clean_response)
-            self._log(f"Map:{quarter} JSON 解析成功 | keys={len(result) if isinstance(result, dict) else 'non-object'}")
+            result = validate_map_result(json.loads(clean_response))
+            self._log(f"Map:{quarter} JSON 解析及结构校验成功 | keys={len(result)}")
             return result
             
         except Exception as e:
             self._log(f"Map:{quarter} 失败 | error_type={type(e).__name__} | error={e}")
             raise RuntimeError(f"Map 阶段 {quarter} 失败: {e}") from e
 
-    def generate_annual_report(self, quarterly_results: List[Dict], global_stats: Dict, anime_theme: str = "default", custom_theme_prompt: str = "", model: str = None, is_periodic: bool = False) -> Dict[str, Any]:
+    def generate_annual_report(
+        self,
+        quarterly_results: List[Dict],
+        global_stats: Dict,
+        anime_theme: str = "default",
+        custom_theme_prompt: str = "",
+        model: str = None,
+        is_periodic: bool = False,
+        report_scope: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         执行 Reduce 阶段：生成年度/阶段汇总内容 (JSON)。
         """
@@ -76,7 +98,14 @@ class ReportGenerator:
         # 作用: 汇总所有中间态，生成最终文案
         # 关联: 输出 JSON 内容，包含各模块的 HTML 片段
         
-        prompt = self.prompts.build_reduce_prompt(quarterly_results, global_stats, anime_theme, custom_theme_prompt, is_periodic=is_periodic)
+        prompt = self.prompts.build_reduce_prompt(
+            quarterly_results,
+            global_stats,
+            anime_theme,
+            custom_theme_prompt,
+            is_periodic=is_periodic,
+            report_scope=report_scope,
+        )
         system_prompt = "你是一个 JSON 生成器。请仅返回合法的 JSON 数据，不要包含 markdown 代码块标记。"
         
         try:
@@ -96,16 +125,10 @@ class ReportGenerator:
             if clean_response.endswith("```"):
                 clean_response = clean_response[:-3]
                 
-            result = json.loads(clean_response)
+            result = validate_reduce_result(json.loads(clean_response))
             self._log(
-                f"Reduce:汇总报告 JSON 解析成功 | "
-                f"keys={len(result) if isinstance(result, dict) else 'non-object'}"
+                f"Reduce:汇总报告 JSON 解析及结构校验成功 | keys={len(result)}"
             )
-            
-            # Ensure anime_theater exists (fallback for missing key)
-            if "anime_theater" not in result or not result["anime_theater"]:
-                result["anime_theater"] = "<h3>动漫IP小剧场</h3><p>（AI 似乎忘了生成小剧场，可能是因为 Token 限制或遗漏。请尝试增加 Token 预算或重试。）</p>"
-                
             return result
         except Exception as e:
              self._log(f"Reduce:汇总报告 失败 | error_type={type(e).__name__} | error={e}")

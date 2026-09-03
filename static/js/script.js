@@ -222,6 +222,7 @@ async function inspectFile(file) {
     const percentSpan = document.getElementById('status-percent');
     const logBox = document.getElementById('log-box');
     const resultActions = document.getElementById('result-actions');
+    const resultFailures = document.getElementById('result-failures');
     const yearSelection = document.getElementById('year-selection');
 
     pendingInspectionId = null;
@@ -232,6 +233,7 @@ async function inspectFile(file) {
     percentSpan.innerText = '0%';
     statusMsg.style.color = '#666';
     logBox.innerHTML = '';
+    if (resultFailures) resultFailures.innerHTML = '';
 
     const formData = new FormData();
     formData.append('file', file);
@@ -383,17 +385,27 @@ async function pollProgress(taskId) {
             percentSpan.innerText = `${pct}%`;
             statusMsg.innerText = data.status_text || "处理中...";
 
-            if (data.state === 'completed') {
+            if (data.state === 'completed' || data.state === 'partial') {
                 clearInterval(interval);
-                statusMsg.innerText = "✅ 分析完成！";
+                statusMsg.innerText = data.state === 'partial'
+                    ? "⚠️ 分析部分完成"
+                    : "✅ 分析完成！";
+                statusMsg.style.color = data.state === 'partial' ? '#b26a00' : '#333';
                 resultActions.style.display = 'block';
                 renderResultLinks(data);
+                renderFailureMessages(data);
+                if (data.state === 'partial' && Array.isArray(data.failures)) {
+                    data.failures.forEach((failure) => {
+                        if (failure && failure.error) log(`部分失败: ${failure.error}`);
+                    });
+                }
                 loadHistory(); // Refresh history
             } else if (data.state === 'failed') {
                 clearInterval(interval);
                 statusMsg.innerText = "❌ 分析失败";
                 statusMsg.style.color = "red";
                 log(`ERROR: ${data.error}`);
+                renderFailureMessages(data);
             }
 
         } catch (e) {
@@ -428,6 +440,30 @@ function renderResultLinks(data) {
     if (resultLinks.childElementCount === 0) {
         resultLinks.innerText = '报告文件未找到';
     }
+}
+
+function renderFailureMessages(data) {
+    const container = document.getElementById('result-failures');
+    if (!container) return;
+    container.innerHTML = '';
+    const failures = Array.isArray(data.failures) ? data.failures : [];
+    if (failures.length === 0) return;
+
+    const title = document.createElement('div');
+    title.innerText = '失败项';
+    title.style.fontWeight = 'bold';
+    title.style.marginTop = '10px';
+    container.appendChild(title);
+
+    failures.forEach((failure) => {
+        const item = document.createElement('div');
+        const label = failure.label || failure.name || failure.phase || '未知任务';
+        item.innerText = `${label}: ${failure.error || '未知错误'}`;
+        item.style.color = '#b24a00';
+        item.style.fontSize = '0.85rem';
+        item.style.marginTop = '4px';
+        container.appendChild(item);
+    });
 }
 
 function log(msg) {
